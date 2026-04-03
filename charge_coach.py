@@ -175,6 +175,28 @@ if st.session_state.api_keys_list:
 st.title("☕ 溫充電教練 (Warm Charge Coach)")
 st.markdown("這裡沒有評價，沒有標準答案。只有陪伴與優勢的尋找。")
 
+# --- 容納之窗視覺圖解 ---
+with st.expander("🖼️ 什麼是『容納之窗』？ (點擊查看圖解)", expanded=False):
+    st.markdown("""
+    <div style='text-align: center; font-family: sans-serif;'>
+        <div style='background-color: #ffe6e6; color: #cc0000; padding: 15px; border-radius: 8px; margin-bottom: 8px; border: 1px dashed #ff9999;'>
+            🔥 <b>過度激患 (Hyperarousal)</b><br>
+            <span style='font-size: 0.9em;'>焦慮、煩躁、恐慌、想發脾氣、過度警覺</span>
+        </div>
+        <div style='background-color: #e6ffe6; color: #006600; padding: 20px; border-radius: 8px; border: 3px solid #4CAF50; margin-bottom: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1);'>
+            💚 <b>容納之窗 (Window of Tolerance)</b><br>
+            <span style='font-size: 0.9em;'>平靜、安全、能自我調節、能清晰思考與應對</span>
+        </div>
+        <div style='background-color: #e6f2ff; color: #004080; padding: 15px; border-radius: 8px; border: 1px dashed #99ccff;'>
+            ❄️ <b>過低激患 (Hypoarousal)</b><br>
+            <span style='font-size: 0.9em;'>疲憊、無力、麻木、想逃避、大腦當機</span>
+        </div>
+    </div>
+    <p style='text-align: center; font-size: 0.85em; color: gray; margin-top: 10px;'>
+    💡 壓力會將我們推出窗外。教練的目標是陪伴您，透過微小行動慢慢回到中間的綠色安全區。
+    </p>
+    """, unsafe_allow_html=True)
+
 if st.session_state.api_keys_list and st.session_state.valid_model_name:
 
     if not st.session_state.chat_session_initialized:
