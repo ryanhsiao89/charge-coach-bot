@@ -129,15 +129,18 @@ def reset_app():
     st.session_state.app_phase = "login"
     st.session_state.history = []
     st.session_state.energy_log = []
+    st.session_state.user_nickname = "" # 清空登入名稱
     st.session_state.start_time = datetime.now()
 
 # --- 側邊欄：金鑰與重置 ---
-st.sidebar.title(f"👤 {st.session_state.user_nickname if st.session_state.user_nickname else '尚未登入'}")
-if st.sidebar.button("🔄 重新開始", type="secondary"):
-    reset_app()
-    st.rerun()
+# 只有當使用者輸入稱呼登入後，才顯示名字和重新開始按鈕
+if st.session_state.user_nickname:
+    st.sidebar.title(f"👤 {st.session_state.user_nickname}")
+    if st.sidebar.button("🔄 重新開始", type="secondary"):
+        reset_app()
+        st.rerun()
+    st.sidebar.markdown("---")
 
-st.sidebar.markdown("---")
 st.sidebar.warning("🔑 請輸入 Gemini API Key")
 input_key = st.sidebar.text_input("貼上 API Key (可用逗號隔開多組)", type="password", value=st.session_state.raw_api_key_input)
 if input_key:
@@ -152,6 +155,7 @@ if has_api_key:
         genai.configure(api_key=st.session_state.api_keys_list[0])
         available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
         if available_models:
+            # 設定 2.5-flash 為預設選項
             default_idx = available_models.index("models/gemini-2.5-flash") if "models/gemini-2.5-flash" in available_models else 0
             st.session_state.valid_model_name = st.sidebar.selectbox("🤖 AI 模型", available_models, index=default_idx)
     except: 
@@ -168,7 +172,7 @@ st.title("☕ 溫充電教練 (動態互動版)")
 if st.session_state.app_phase == "login":
     st.markdown("### 先顧好自己，AI 才能幫上忙。")
     
-    # 優雅的防護提示，取代原本粗暴的 st.stop()
+    # 優雅的防護提示
     if not has_api_key:
         st.warning("⚠️ 系統尚未連線：請先在左側邊欄輸入您的「API Key」來解鎖充電站大門喔！")
         
