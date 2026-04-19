@@ -67,11 +67,16 @@ def auto_save_to_google_sheets(user_id, chat_history, energy_log):
         print(f"背景上傳失敗: {e}")
         return False
 
-# --- API 輪替與防呆發送機制 ---
+# --- API 輪替與防呆發送機制 (角色防護 + 歷史修正版) ---
 def send_message_safely(text):
     time.sleep(1) 
+    
+    # 【關鍵防護 1】抽離系統設定，防止教練角色混亂
+    system_prompt = st.session_state.history[0]["content"]
+    
+    # 【關鍵防護 2】組合歷史紀錄時，扣除「最後一筆 (剛輸入的話)」，避免 API 判定連發兩次 User 而當機！
     gemini_history = []
-    for msg in st.session_state.history:
+    for msg in st.session_state.history[1:-1]:
         g_role = "model" if msg["role"] == "assistant" else "user"
         gemini_history.append({"role": g_role, "parts": [msg["content"]]})
         
@@ -83,8 +88,11 @@ def send_message_safely(text):
         active_key = api_keys[current_key_index]
         try:
             genai.configure(api_key=active_key)
+            
+            # 將教練設定鎖死在底層
             model = genai.GenerativeModel(
                 model_name=st.session_state.valid_model_name,
+                system_instruction=system_prompt,
                 safety_settings={
                     HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
                     HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
@@ -114,7 +122,7 @@ if "start_time" not in st.session_state: st.session_state.start_time = datetime.
 if "raw_api_key_input" not in st.session_state: st.session_state.raw_api_key_input = ""
 if "api_keys_list" not in st.session_state: st.session_state.api_keys_list = []
 if "current_key_index" not in st.session_state: st.session_state.current_key_index = 0
-if "valid_model_name" not in st.session_state: st.session_state.valid_model_name = "gemini-1.5-pro-latest"
+if "valid_model_name" not in st.session_state: st.session_state.valid_model_name = "gemini-2.5-flash"
 
 # 導覽/重置功能
 def reset_app():
@@ -141,7 +149,9 @@ if st.session_state.api_keys_list:
         genai.configure(api_key=st.session_state.api_keys_list[0])
         available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
         if available_models:
-            st.session_state.valid_model_name = st.sidebar.selectbox("🤖 AI 模型", available_models)
+            # 設定 2.5-flash 為預設選項
+            default_idx = available_models.index("models/gemini-2.5-flash") if "models/gemini-2.5-flash" in available_models else 0
+            st.session_state.valid_model_name = st.sidebar.selectbox("🤖 AI 模型", available_models, index=default_idx)
     except: 
         st.sidebar.error("❌ API Key 無效")
 
