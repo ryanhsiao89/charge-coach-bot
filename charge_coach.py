@@ -144,20 +144,20 @@ if input_key:
     st.session_state.raw_api_key_input = input_key
     st.session_state.api_keys_list = [k.strip() for k in input_key.split(",") if k.strip()]
 
-if st.session_state.api_keys_list:
+# 判斷是否已經有輸入 Key
+has_api_key = len(st.session_state.api_keys_list) > 0
+
+if has_api_key:
     try:
         genai.configure(api_key=st.session_state.api_keys_list[0])
         available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
         if available_models:
-            # 設定 2.5-flash 為預設選項
             default_idx = available_models.index("models/gemini-2.5-flash") if "models/gemini-2.5-flash" in available_models else 0
             st.session_state.valid_model_name = st.sidebar.selectbox("🤖 AI 模型", available_models, index=default_idx)
     except: 
         st.sidebar.error("❌ API Key 無效")
-
-if not st.session_state.api_keys_list:
-    st.info("💡 請先在左側輸入 API Key 以啟動系統。")
-    st.stop()
+else:
+    st.sidebar.info("💡 提示：請在此輸入 API Key 以解鎖系統。")
 
 # ==========================================
 # 畫面流程控制 (Phase Logic)
@@ -167,8 +167,15 @@ st.title("☕ 溫充電教練 (動態互動版)")
 # 【階段 1】：登入畫面
 if st.session_state.app_phase == "login":
     st.markdown("### 先顧好自己，AI 才能幫上忙。")
-    nickname_input = st.text_input("請輸入您的稱呼：", placeholder="例如：大業國小王老師") 
-    if st.button("🚀 進入充電站", type="primary"):
+    
+    # 優雅的防護提示，取代原本粗暴的 st.stop()
+    if not has_api_key:
+        st.warning("⚠️ 系統尚未連線：請先在左側邊欄輸入您的「API Key」來解鎖充電站大門喔！")
+        
+    # 如果沒有 Key，輸入框和按鈕就會變灰無法點擊
+    nickname_input = st.text_input("請輸入您的稱呼：", placeholder="例如：大業國小王老師", disabled=not has_api_key) 
+    
+    if st.button("🚀 進入充電站", type="primary", disabled=not has_api_key):
         if nickname_input.strip():
             st.session_state.user_nickname = nickname_input
             st.session_state.app_phase = "initial_checkin"
@@ -289,7 +296,6 @@ elif st.session_state.app_phase == "show_chart":
     df_chart = pd.DataFrame(st.session_state.energy_log)
     
     # 建立 Altair 容納之窗圖表
-    # 1. 繪製折線與資料點
     line = alt.Chart(df_chart).mark_line(color='#424242', size=4).encode(
         x=alt.X('階段:N', sort=['開始前', '結束後'], title='對話階段', axis=alt.Axis(labelAngle=0, labelFontSize=14)),
         y=alt.Y('分數:Q', scale=alt.Scale(domain=[0, 10]), title='狀態分數')
@@ -300,22 +306,18 @@ elif st.session_state.app_phase == "show_chart":
         tooltip=['階段', '分數']
     )
     
-    # 2. 繪製背景顏色帶 (紅、綠、藍)
     band_red = alt.Chart(pd.DataFrame({'y1': [7], 'y2': [10]})).mark_rect(color='#ffcccc', opacity=0.4).encode(y='y1:Q', y2='y2:Q')
     band_green = alt.Chart(pd.DataFrame({'y1': [4], 'y2': [7]})).mark_rect(color='#ccffcc', opacity=0.4).encode(y='y1:Q', y2='y2:Q')
     band_blue = alt.Chart(pd.DataFrame({'y1': [0], 'y2': [4]})).mark_rect(color='#cce5ff', opacity=0.4).encode(y='y1:Q', y2='y2:Q')
     
-    # 3. 添加區域標籤
     text_red = alt.Chart(pd.DataFrame({'x': ['開始前'], 'y': [9], 'text': ['🔥 過度激患 (焦慮/煩躁)']})).mark_text(align='left', dx=10, fontSize=16, color='#d32f2f', fontWeight='bold', opacity=0.5).encode(x='x:N', y='y:Q', text='text:N')
     text_green = alt.Chart(pd.DataFrame({'x': ['開始前'], 'y': [5.5], 'text': ['💚 容納之窗 (平靜/穩定)']})).mark_text(align='left', dx=10, fontSize=16, color='#2e7d32', fontWeight='bold', opacity=0.5).encode(x='x:N', y='y:Q', text='text:N')
     text_blue = alt.Chart(pd.DataFrame({'x': ['開始前'], 'y': [2], 'text': ['❄️ 過低激患 (疲憊/無力)']})).mark_text(align='left', dx=10, fontSize=16, color='#1565c0', fontWeight='bold', opacity=0.5).encode(x='x:N', y='y:Q', text='text:N')
 
-    # 合併所有圖層
     final_chart = alt.layer(band_red, band_green, band_blue, text_red, text_green, text_blue, line, points).properties(
         height=400
     )
     
-    # 顯示圖表
     st.altair_chart(final_chart, use_container_width=True)
     
     st.markdown("""
