@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import altair as alt
+import json
 from datetime import datetime, timedelta
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
@@ -67,14 +68,15 @@ def auto_save_to_google_sheets(user_id, chat_history, energy_log):
         print(f"背景上傳失敗: {e}")
         return False
 
-# --- API 輪替與防呆發送機制 (角色防護 + 歷史修正版) ---
+# --- API 輪替與防呆發送機制 (角色防護 + 完美歷史序列版) ---
 def send_message_safely(text):
     time.sleep(1) 
     
-    # 【關鍵防護 1】抽離系統設定，防止教練角色混亂
+    # 抽離系統設定鎖定角色
     system_prompt = st.session_state.history[0]["content"]
     
-    # 【關鍵防護 2】組合歷史紀錄時，扣除「最後一筆 (剛輸入的話)」，避免 API 判定連發兩次 User 而當機！
+    # 【完美防當機修正】：Gemini 嚴格規定歷史紀錄必須由 User 開頭且角色交替。
+    # 我們的歷史紀錄在 [1] 塞入了一個虛擬 User 訊息，因此切片從 [1:-1] 能完美取得合法的歷史序列！
     gemini_history = []
     for msg in st.session_state.history[1:-1]:
         g_role = "model" if msg["role"] == "assistant" else "user"
@@ -88,8 +90,6 @@ def send_message_safely(text):
         active_key = api_keys[current_key_index]
         try:
             genai.configure(api_key=active_key)
-            
-            # 將教練設定鎖死在底層
             model = genai.GenerativeModel(
                 model_name=st.session_state.valid_model_name,
                 system_instruction=system_prompt,
@@ -129,14 +129,13 @@ def reset_app():
     st.session_state.app_phase = "login"
     st.session_state.history = []
     st.session_state.energy_log = []
-    st.session_state.user_nickname = "" # 清空登入名稱
+    st.session_state.user_nickname = "" 
     st.session_state.start_time = datetime.now()
 
 # --- 側邊欄：金鑰與重置 ---
-# 只有當使用者輸入稱呼登入後，才顯示名字和重新開始按鈕
 if st.session_state.user_nickname:
     st.sidebar.title(f"👤 {st.session_state.user_nickname}")
-    if st.sidebar.button("🔄 重新開始", type="secondary"):
+    if st.sidebar.button("🔄 重新開始 / 切換帳號", type="secondary"):
         reset_app()
         st.rerun()
     st.sidebar.markdown("---")
@@ -147,7 +146,6 @@ if input_key:
     st.session_state.raw_api_key_input = input_key
     st.session_state.api_keys_list = [k.strip() for k in input_key.split(",") if k.strip()]
 
-# 判斷是否已經有輸入 Key
 has_api_key = len(st.session_state.api_keys_list) > 0
 
 if has_api_key:
@@ -155,7 +153,6 @@ if has_api_key:
         genai.configure(api_key=st.session_state.api_keys_list[0])
         available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
         if available_models:
-            # 設定 2.5-flash 為預設選項
             default_idx = available_models.index("models/gemini-2.5-flash") if "models/gemini-2.5-flash" in available_models else 0
             st.session_state.valid_model_name = st.sidebar.selectbox("🤖 AI 模型", available_models, index=default_idx)
     except: 
@@ -168,24 +165,43 @@ else:
 # ==========================================
 st.title("☕ 溫充電教練 (動態互動版)")
 
-# 【階段 1】：登入畫面
+# 【階段 1】：登入與讀取畫面
 if st.session_state.app_phase == "login":
     st.markdown("### 先顧好自己，AI 才能幫上忙。")
-    
-    # 優雅的防護提示
     if not has_api_key:
         st.warning("⚠️ 系統尚未連線：請先在左側邊欄輸入您的「API Key」來解鎖充電站大門喔！")
         
-    # 如果沒有 Key，輸入框和按鈕就會變灰無法點擊
-    nickname_input = st.text_input("請輸入您的稱呼：", placeholder="例如：大業國小王老師", disabled=not has_api_key) 
+    tab1, tab2 = st.tabs(["✨ 新的充電", "📂 載入過去紀錄 (延續走勢)"])
     
-    if st.button("🚀 進入充電站", type="primary", disabled=not has_api_key):
-        if nickname_input.strip():
-            st.session_state.user_nickname = nickname_input
-            st.session_state.app_phase = "initial_checkin"
-            st.rerun()
-        else:
-            st.error("❌ 稱呼不能為空！")
+    with tab1:
+        nickname_input = st.text_input("請輸入您的稱呼：", placeholder="例如：大業國小王老師", disabled=not has_api_key, key="new_login") 
+        if st.button("🚀 進入充電站", type="primary", disabled=not has_api_key):
+            if nickname_input.strip():
+                st.session_state.user_nickname = nickname_input
+                st.session_state.app_phase = "initial_checkin"
+                st.rerun()
+            else:
+                st.error("❌ 稱呼不能為空！")
+                
+    with tab2:
+        st.info("如果您之前下載過專屬的「充電紀錄 (.json)」，請在此上傳。教練會記住您過去的歷程，並為您繪製跨日的能量走勢圖！")
+        uploaded_file = st.file_uploader("上傳您的充電紀錄", type=['json'], disabled=not has_api_key)
+        if uploaded_file is not None and has_api_key:
+            try:
+                data = json.load(uploaded_file)
+                if "history" in data and "energy_log" in data:
+                    st.success(f"✅ 成功喚醒記憶！歡迎回來，{data.get('nickname', '老師')}。")
+                    if st.button("🚀 繼續今日充電", type="primary"):
+                        st.session_state.user_nickname = data.get("nickname", "老師")
+                        st.session_state.history = data["history"]
+                        st.session_state.energy_log = data["energy_log"]
+                        st.session_state.start_time = datetime.now() # 重置本次上線時間
+                        st.session_state.app_phase = "initial_checkin"
+                        st.rerun()
+                else:
+                    st.error("❌ 檔案格式不正確，找不到紀錄。")
+            except Exception as e:
+                st.error(f"❌ 讀取失敗: {e}")
 
 # 【階段 2】：開始前測 (自評狀態)
 elif st.session_state.app_phase == "initial_checkin":
@@ -201,9 +217,11 @@ elif st.session_state.app_phase == "initial_checkin":
     initial_score = st.slider("👉 您現在的能量落在哪個區間？", 0, 10, 5)
     
     if st.button("💾 記錄並開始對話", type="primary"):
-        st.session_state.energy_log.append({"階段": "開始前", "分數": initial_score, "次序": 1})
+        # 動態日期時間標籤，確保走勢圖跨日能連貫
+        today_str = (datetime.now() + timedelta(hours=8)).strftime("%m/%d")
+        phase_name = f"{today_str} 前"
+        st.session_state.energy_log.append({"階段": phase_name, "分數": initial_score, "排序": len(st.session_state.energy_log) + 1})
         
-        # 初始化 AI Prompt
         sys_prompt = f"""
         Role: You are the "Warm Charge Coach" (溫充電教練), an AI assistant designed specifically for educators to practice self-care based on Trauma-Informed Care (TIC) and the Strengths Perspective.
         Target Audience: A stressed or tired school teacher.
@@ -230,7 +248,6 @@ elif st.session_state.app_phase == "initial_checkin":
         - Do not explain you are an AI.
         """
         
-        # 根據老師的自評給出不同的溫暖開場白
         if initial_score >= 8:
             state_msg = "看到您剛剛標記的狀態落在比較焦慮、煩躁的紅區。辛苦您了，現在的神經系統一定很緊繃吧。"
         elif initial_score <= 3:
@@ -238,33 +255,38 @@ elif st.session_state.app_phase == "initial_checkin":
         else:
             state_msg = "看到您剛剛標記的狀態落在相對平穩的綠區，這是一個很好的開始。"
             
-        welcome_msg = f"(為您拉開一張舒適的椅子，倒了一杯溫水)\n\n{state_msg}\n\n這裡非常安全，沒有人會評價您。今天讓您感到最耗能、最辛苦的事情是什麼呢？願意跟我分享嗎？"
-        
-        st.session_state.history = [
-            {"role": "user", "content": sys_prompt}, 
-            {"role": "assistant", "content": welcome_msg}
-        ]
+        # 判斷是第一次使用，還是載入舊檔延續
+        if len(st.session_state.history) == 0:
+            welcome_msg = f"(為您拉開一張舒適的椅子，倒了一杯溫水)\n\n{state_msg}\n\n這裡非常安全，沒有人會評價您。今天讓您感到最耗能、最辛苦的事情是什麼呢？願意跟我分享嗎？"
+            st.session_state.history = [
+                {"role": "user", "content": sys_prompt}, 
+                {"role": "user", "content": "教練，我準備好要開始充電了。"}, # 防止 Gemini 角色序列當機的關鍵虛擬句
+                {"role": "assistant", "content": welcome_msg}
+            ]
+        else:
+            resume_welcome_msg = f"(為您拉開一張舒適的椅子，倒了一杯溫水)\n\n歡迎回來！{state_msg}\n\n距離我們上次聊聊又過了一陣子，今天過得好嗎？有什麼最讓您感到耗能的事情，願意跟我分享嗎？"
+            st.session_state.history.append({"role": "user", "content": f"[系統提示：這是新的一天。使用者登入自評能量為 {initial_score} 分。請接續過去的記憶，關懷使用者今天的狀況。]"})
+            st.session_state.history.append({"role": "assistant", "content": resume_welcome_msg})
+
         st.session_state.app_phase = "chatting"
         st.rerun()
 
 # 【階段 3】：對話中
 elif st.session_state.app_phase == "chatting":
     
-    # 頂部顯示離開按鈕
     col1, col2 = st.columns([4, 1])
     with col2:
         if st.button("🏁 結束對話，查看能量走勢", help="點擊此按鈕結束本次充電，並生成走勢圖"):
             st.session_state.app_phase = "final_checkin"
             st.rerun()
 
-    # 顯示對話歷史
     for msg in st.session_state.history:
         role = "assistant" if msg["role"] == "assistant" else "user"
-        if "Role: You are the \"Warm Charge Coach\"" not in msg["content"]:
+        # 隱藏系統提示句
+        if "Role: You are the" not in msg["content"] and "[系統提示" not in msg["content"] and "準備好要開始" not in msg["content"]:
             with st.chat_message(role):
                 st.write(msg["content"])
 
-    # 對話輸入框
     if user_in := st.chat_input("分享您的感受... (可用括號描述動作)"):
         st.session_state.history.append({"role": "user", "content": user_in})
         with st.chat_message("user"):
@@ -285,27 +307,36 @@ elif st.session_state.app_phase == "final_checkin":
     st.markdown("### 🏁 梳理完畢，您現在感覺如何？")
     st.info("經過剛剛的梳理與對話，請再次評估您現在的神經系統狀態。")
     
+    st.markdown("""
+    **💡 容納之窗參考指標：**
+    * **8~10分 (紅區)**：過度激患 (焦慮、煩躁、恐慌、想發脾氣)
+    * **4~7分 (綠區)**：容納之窗 (平靜、安全、能自我調節)
+    * **0~3分 (藍區)**：過低激患 (疲憊、無力、麻木、大腦當機)
+    """)
+    
     final_score = st.slider("👉 對話後的能量區間：", 0, 10, 5)
     
     if st.button("📊 生成我的專屬能量走勢圖", type="primary"):
-        st.session_state.energy_log.append({"階段": "結束後", "分數": final_score, "次序": 2})
+        today_str = (datetime.now() + timedelta(hours=8)).strftime("%m/%d")
+        phase_name = f"{today_str} 後"
+        st.session_state.energy_log.append({"階段": phase_name, "分數": final_score, "排序": len(st.session_state.energy_log) + 1})
         auto_save_to_google_sheets(st.session_state.user_nickname, st.session_state.history, st.session_state.energy_log)
         st.session_state.app_phase = "show_chart"
         st.rerun()
 
-# 【階段 5】：顯示動態走勢圖
+# 【階段 5】：顯示動態走勢圖與下載
 elif st.session_state.app_phase == "show_chart":
     st.success("🎉 恭喜您完成了一次自我照顧的練習！以下是您的能量軌跡：")
     
     df_chart = pd.DataFrame(st.session_state.energy_log)
     
-    # 建立 Altair 容納之窗圖表
+    # Altair 圖表 (動態排序，支援多天無限延伸)
     line = alt.Chart(df_chart).mark_line(color='#424242', size=4).encode(
-        x=alt.X('階段:N', sort=['開始前', '結束後'], title='對話階段', axis=alt.Axis(labelAngle=0, labelFontSize=14)),
+        x=alt.X('階段:N', sort=alt.EncodingSortField(field='排序', order='ascending'), title='對話階段', axis=alt.Axis(labelAngle=-45, labelFontSize=12)),
         y=alt.Y('分數:Q', scale=alt.Scale(domain=[0, 10]), title='狀態分數')
     )
-    points = alt.Chart(df_chart).mark_circle(size=200, color='#1E88E5', opacity=1).encode(
-        x=alt.X('階段:N', sort=['開始前', '結束後']),
+    points = alt.Chart(df_chart).mark_circle(size=150, color='#1E88E5', opacity=1).encode(
+        x=alt.X('階段:N', sort=alt.EncodingSortField(field='排序', order='ascending')),
         y=alt.Y('分數:Q'),
         tooltip=['階段', '分數']
     )
@@ -314,9 +345,11 @@ elif st.session_state.app_phase == "show_chart":
     band_green = alt.Chart(pd.DataFrame({'y1': [4], 'y2': [7]})).mark_rect(color='#ccffcc', opacity=0.4).encode(y='y1:Q', y2='y2:Q')
     band_blue = alt.Chart(pd.DataFrame({'y1': [0], 'y2': [4]})).mark_rect(color='#cce5ff', opacity=0.4).encode(y='y1:Q', y2='y2:Q')
     
-    text_red = alt.Chart(pd.DataFrame({'x': ['開始前'], 'y': [9], 'text': ['🔥 過度激患 (焦慮/煩躁)']})).mark_text(align='left', dx=10, fontSize=16, color='#d32f2f', fontWeight='bold', opacity=0.5).encode(x='x:N', y='y:Q', text='text:N')
-    text_green = alt.Chart(pd.DataFrame({'x': ['開始前'], 'y': [5.5], 'text': ['💚 容納之窗 (平靜/穩定)']})).mark_text(align='left', dx=10, fontSize=16, color='#2e7d32', fontWeight='bold', opacity=0.5).encode(x='x:N', y='y:Q', text='text:N')
-    text_blue = alt.Chart(pd.DataFrame({'x': ['開始前'], 'y': [2], 'text': ['❄️ 過低激患 (疲憊/無力)']})).mark_text(align='left', dx=10, fontSize=16, color='#1565c0', fontWeight='bold', opacity=0.5).encode(x='x:N', y='y:Q', text='text:N')
+    # 將文字標籤錨定在第一個資料點上方
+    first_stage = df_chart['階段'].iloc[0]
+    text_red = alt.Chart(pd.DataFrame({'x': [first_stage], 'y': [9], 'text': ['🔥 過度激患 (焦慮/煩躁)']})).mark_text(align='left', dx=10, fontSize=16, color='#d32f2f', fontWeight='bold', opacity=0.5).encode(x='x:N', y='y:Q', text='text:N')
+    text_green = alt.Chart(pd.DataFrame({'x': [first_stage], 'y': [5.5], 'text': ['💚 容納之窗 (平靜/穩定)']})).mark_text(align='left', dx=10, fontSize=16, color='#2e7d32', fontWeight='bold', opacity=0.5).encode(x='x:N', y='y:Q', text='text:N')
+    text_blue = alt.Chart(pd.DataFrame({'x': [first_stage], 'y': [2], 'text': ['❄️ 過低激患 (疲憊/無力)']})).mark_text(align='left', dx=10, fontSize=16, color='#1565c0', fontWeight='bold', opacity=0.5).encode(x='x:N', y='y:Q', text='text:N')
 
     final_chart = alt.layer(band_red, band_green, band_blue, text_red, text_green, text_blue, line, points).properties(
         height=400
@@ -327,9 +360,29 @@ elif st.session_state.app_phase == "show_chart":
     st.markdown("""
     > 💡 **教練的悄悄話**：
     > 不論線條最後停在哪裡，請記得，情緒是流動的。
-    > 覺察到自己的狀態，並願意花這 5 分鐘陪伴自己，您就已經做出了最棒的選擇。
+    > 點擊下方下載您的專屬紀錄，明天再來找我充充電吧！
     """)
     
-    if st.button("🏠 回到首頁 / 下一位使用者"):
-        reset_app()
-        st.rerun()
+    st.markdown("---")
+    colA, colB = st.columns(2)
+    
+    with colA:
+        # 將對話歷史與能量分數打包成 JSON 供下次匯入
+        export_data = {
+            "nickname": st.session_state.user_nickname,
+            "history": st.session_state.history,
+            "energy_log": st.session_state.energy_log
+        }
+        json_str = json.dumps(export_data, ensure_ascii=False, indent=2)
+        st.download_button(
+            label="📥 下載專屬充電記憶 (.json)",
+            data=json_str,
+            file_name=f"ChargeCoach_Memory_{st.session_state.user_nickname}_{datetime.now().strftime('%Y%m%d')}.json",
+            mime="application/json",
+            type="primary"
+        )
+        
+    with colB:
+        if st.button("🏠 登出 / 下一位使用者"):
+            reset_app()
+            st.rerun()
