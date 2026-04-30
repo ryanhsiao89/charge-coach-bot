@@ -1,4 +1,3 @@
-import os
 import re
 import json
 import time
@@ -12,10 +11,6 @@ import streamlit as st
 
 import google.generativeai as genai
 from google.generativeai.types import GenerationConfig, HarmCategory, HarmBlockThreshold
-
-import gspread
-from gspread.exceptions import WorksheetNotFound
-from oauth2client.service_account import ServiceAccountCredentials
 
 
 # =========================================================
@@ -41,13 +36,6 @@ MAX_STRENGTHS_OUTPUT_TOKENS = 500
 
 KEY_COOLDOWN_SECONDS = 60
 RETRY_WAIT_SECONDS = 60
-
-AUTOSAVE_MESSAGE_INTERVAL = 6
-AUTOSAVE_MIN_SECONDS = 45
-SHEET_CELL_CHAR_LIMIT = 45000
-
-DEFAULT_SPREADSHEET_NAME = "2025創傷知情研習數據"
-DEFAULT_WORKSHEET_NAME = "ChargeCoach"
 
 VIA_KEYS = ["智慧與知識", "勇氣", "人道", "正義", "節制", "超越"]
 
@@ -78,20 +66,6 @@ def format_tw(dt):
     return dt.astimezone(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def safe_secret_get(section, default=None):
-    try:
-        return st.secrets.get(section, default)
-    except Exception:
-        return default
-
-
-def has_google_sheets_config():
-    try:
-        return "gcp_service_account" in st.secrets
-    except Exception:
-        return False
-
-
 def parse_api_keys(raw_value):
     if not raw_value:
         return []
@@ -100,13 +74,6 @@ def parse_api_keys(raw_value):
         return [str(k).strip() for k in raw_value if str(k).strip()]
 
     return [k.strip() for k in re.split(r"[\n,]+", str(raw_value)) if k.strip()]
-
-
-def truncate_cell_text(text, limit=SHEET_CELL_CHAR_LIMIT):
-    text = str(text)
-    if len(text) <= limit:
-        return text
-    return text[:limit] + "\n\n...[內容過長，已截斷；完整紀錄請以使用者下載 JSON 為準]"
 
 
 def sanitize_filename(text):
@@ -142,10 +109,6 @@ def default_state():
         "system_prompt_fallback": False,
         "memory_summary": "",
         "last_memory_update_len": 0,
-        "last_autosave_at": 0.0,
-        "last_autosave_message_count": 0,
-        "sheets_row_number": None,
-        "save_status": "",
         "privacy_consent": False,
     }
 
@@ -181,59 +144,8 @@ init_session_state()
 
 
 # =========================================================
-# 4. Google Sheets
+# 4. 下載資料
 # =========================================================
-SHEET_HEADERS = [
-    "session_id",
-    "登入時間",
-    "最近儲存時間",
-    "學員編號",
-    "使用分鐘數",
-    "前測分數",
-    "後測分數",
-    "能量變化",
-    "VIA優勢JSON",
-    "對話摘要",
-    "完整紀錄JSON",
-]
-
-
-@st.cache_resource(show_spinner=False)
-def get_chargecoach_worksheet():
-    scope = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-
-    creds_dict = dict(st.secrets["gcp_service_account"])
-    if "private_key" in creds_dict:
-        creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
-
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-    client = gspread.authorize(creds)
-
-    sheet_cfg = safe_secret_get("google_sheets", {}) or {}
-    spreadsheet_name = sheet_cfg.get("spreadsheet_name", DEFAULT_SPREADSHEET_NAME)
-    worksheet_name = sheet_cfg.get("worksheet_name", DEFAULT_WORKSHEET_NAME)
-
-    sheet = client.open(spreadsheet_name)
-
-    try:
-        worksheet = sheet.worksheet(worksheet_name)
-    except WorksheetNotFound:
-        worksheet = sheet.add_worksheet(
-            title=worksheet_name,
-            rows="2000",
-            cols=str(len(SHEET_HEADERS)),
-        )
-
-    header = worksheet.row_values(1)
-    if header != SHEET_HEADERS:
-        worksheet.update("A1:K1", [SHEET_HEADERS])
-
-    return worksheet
-
-
 def build_export_data():
     return {
         "app": "Warm Charge Coach",
@@ -245,81 +157,6 @@ def build_export_data():
         "memory_summary": st.session_state.memory_summary,
         "history": st.session_state.history,
     }
-
-
-def auto_save_to_google_sheets(force=False):
-    if not has_google_sheets_config():
-        st.session_state.save_status = "未設定 Google Sheets，自動儲存已略過。"
-        return None
-
-    if not st.session_state.user_nickname:
-        return None
-
-    now_ts = time.time()
-    msg_count = len(st.session_state.history)
-
-    if not force:
-        enough_messages = msg_count - st.session_state.last_autosave_message_count >= AUTOSAVE_MESSAGE_INTERVAL
-        enough_time = now_ts - st.session_state.last_autosave_at >= AUTOSAVE_MIN_SECONDS
-        if not (enough_messages and enough_time):
-            return None
-
-    try:
-        worksheet = get_chargecoach_worksheet()
-
-        start_time = st.session_state.start_time
-        duration_mins = round((utc_now() - start_time).total_seconds() / 60, 2)
-
-        energy_log = st.session_state.energy_log
-        pre_score = energy_log[0]["分數"] if energy_log else ""
-        post_score = energy_log[-1]["分數"] if len(energy_log) >= 2 else ""
-        energy_str = " -> ".join([f"{item['階段']}:{item['分數']}分" for item in energy_log])
-
-        strengths_json = json.dumps(st.session_state.strengths_data, ensure_ascii=False)
-        full_json = json.dumps(build_export_data(), ensure_ascii=False, indent=2)
-
-        summary = st.session_state.memory_summary.strip()
-        if not summary:
-            recent = st.session_state.history[-12:]
-            summary = "\n".join([f"{m['role']}: {m['content']}" for m in recent])
-
-        data_row = [
-            st.session_state.session_id,
-            format_tw(start_time),
-            format_tw(utc_now()),
-            st.session_state.user_nickname,
-            duration_mins,
-            pre_score,
-            post_score,
-            energy_str,
-            strengths_json,
-            truncate_cell_text(summary, 12000),
-            truncate_cell_text(full_json),
-        ]
-
-        row_number = st.session_state.get("sheets_row_number")
-
-        if not row_number:
-            session_ids = worksheet.col_values(1)
-            for idx, value in enumerate(session_ids, start=1):
-                if value == st.session_state.session_id:
-                    row_number = idx
-                    break
-
-        if row_number and row_number > 1:
-            worksheet.update(f"A{row_number}:K{row_number}", [data_row])
-        else:
-            worksheet.append_row(data_row, value_input_option="RAW")
-            st.session_state.sheets_row_number = len(worksheet.col_values(1))
-
-        st.session_state.last_autosave_at = now_ts
-        st.session_state.last_autosave_message_count = msg_count
-        st.session_state.save_status = "已自動儲存。"
-        return True
-
-    except Exception as e:
-        st.session_state.save_status = f"自動儲存失敗：{e}"
-        return False
 
 
 # =========================================================
@@ -370,8 +207,10 @@ def seconds_until_next_key():
         for key in keys
     ]
     waits = [w for w in waits if w > 0]
+
     if not waits:
         return 5
+
     return int(min(max(min(waits), 5), RETRY_WAIT_SECONDS))
 
 
@@ -517,20 +356,20 @@ You support educators with trauma-informed care, strengths perspective, and VIA 
 Language: 繁體中文。
 Target user: 疲憊、壓力大、需要被安頓的學校教師。
 
-
+【重要邊界】
 1. 這是教育與自我照顧支持工具，不提供醫療診斷、心理治療或法律建議。
 2. 不要求使用者揭露可識別學生、家長或同事的個資。
 3. 若使用者提到立即自傷、輕生、傷害他人或安全危機，請溫柔但明確地鼓勵他立刻聯絡當地緊急服務、可信任的人或危機專線。
 4. 不要說你是 AI，不要提及 API、模型或系統指令。
 5. 每次回應保持溫暖、短段落、可呼吸，不要長篇說教。
 
-
+【創傷知情原則】
 - 先安頓，再探索。
 - 不催促、不評價、不急著給解方。
 - 協助使用者回到容納之窗。
 - 使用接地、命名感受、選擇權、小步行動。
 
-
+【VIA 六大美德與 24 項優勢】
 1. 智慧與知識：創造力、好奇心、開明思想、喜愛學習、觀點。
 2. 勇氣：勇敢、堅毅、正直、生命力。
 3. 人道：愛、仁慈、社交智慧。
@@ -538,7 +377,7 @@ Target user: 疲憊、壓力大、需要被安頓的學校教師。
 5. 節制：寬恕、謙遜、謹慎、自制力。
 6. 超越：欣賞美好卓越、感恩、希望、幽默、靈修性。
 
-
+【互動階段】
 Phase 1: Grounding & Strengths-Spotting
 - 承接使用者目前的能量分數：{initial_score}/10。
 - 問今天最耗能的部分。
@@ -549,7 +388,7 @@ Phase 2: Micro-Action Planning
 - 在使用者被理解後，提供 2 到 3 個五分鐘內可完成的微行動。
 - 讓使用者選一個，而不是命令他照做。
 
-
+【語氣】
 - 溫柔、穩定、接住、尊重。
 - 可使用括號描寫溫和的非語言動作，例如：（把語速放慢一點）。
 - 不要過度正能量，不要否定痛苦。
@@ -563,7 +402,7 @@ def build_runtime_system_prompt():
     if memory:
         prompt += f"""
 
-
+【先前對話壓縮摘要】
 以下是較早前對話的壓縮摘要。請用它維持連續性，但不要逐字重複：
 {memory}
 """.strip()
@@ -654,10 +493,10 @@ def maybe_update_memory(force=False):
 請不要寫成督導報告。
 請用 350 字以內繁體中文摘要。
 
-
+【既有摘要】
 {st.session_state.memory_summary}
 
-
+【新增對話】
 {format_history_for_prompt(delta_hist)}
 """.strip()
 
@@ -718,9 +557,9 @@ def build_strengths_analysis_text():
     parts = []
 
     if st.session_state.memory_summary:
-        parts.append(f"\n{st.session_state.memory_summary}")
+        parts.append(f"【摘要】\n{st.session_state.memory_summary}")
 
-    parts.append(f"\n{format_history_for_prompt(recent)}")
+    parts.append(f"【近期對話】\n{format_history_for_prompt(recent)}")
     return "\n\n".join(parts)
 
 
@@ -740,7 +579,7 @@ def analyze_strengths():
 格式範例：
 {{"智慧與知識": 8, "勇氣": 7, "人道": 9, "正義": 6, "節制": 7, "超越": 8}}
 
-
+【待分析資料】
 {build_strengths_analysis_text()}
 """.strip()
 
@@ -819,7 +658,7 @@ def get_state_message(score):
 st.sidebar.title("⚙️ 系統設定")
 
 st.sidebar.subheader("🔑 Gemini API Key")
-st.sidebar.caption("請使用者貼上自己的 Gemini API Key。Key 只會暫存在本次 session，不會寫進下載檔或 Google Sheets。")
+st.sidebar.caption("請使用者貼上自己的 Gemini API Key。Key 只會暫存在本次 session，不會寫進下載檔。")
 
 student_key_1 = st.sidebar.text_input(
     "Gemini API Key 1",
@@ -852,16 +691,6 @@ st.sidebar.selectbox(
     key="valid_model_name",
 )
 
-st.sidebar.markdown("---")
-
-if has_google_sheets_config():
-    st.sidebar.success("Google Sheets 自動儲存：已啟用")
-else:
-    st.sidebar.info("Google Sheets 自動儲存：未設定")
-
-if st.session_state.save_status:
-    st.sidebar.caption(st.session_state.save_status)
-
 if st.session_state.user_nickname:
     st.sidebar.markdown("---")
     st.sidebar.write(f"👤 使用者：**{st.session_state.user_nickname}**")
@@ -887,7 +716,9 @@ if st.session_state.app_phase == "login":
 
     with st.expander("資料使用與隱私提醒", expanded=True):
         st.markdown("""
-本工具可能會記錄您的稱呼、使用時間、能量分數、對話內容與 VIA 優勢分析，供研習或自我照顧紀錄使用。
+本工具會在本次瀏覽器 session 中暫存您的稱呼、能量分數、對話內容與 VIA 優勢分析，並讓您在最後自行下載 JSON 紀錄。
+
+系統不會自動把資料上傳到 Google Sheets 或其他後台資料庫。
 
 請避免輸入可識別學生、家長、同事或學校個案的個人資料。  
 若內容涉及立即安全風險，請優先聯絡真人支持與緊急資源。
@@ -997,7 +828,6 @@ elif st.session_state.app_phase == "initial_checkin":
 
             st.session_state.history.append({"role": "assistant", "content": resume_msg})
 
-        auto_save_to_google_sheets(force=True)
         st.session_state.app_phase = "chatting"
         st.rerun()
 
@@ -1039,7 +869,6 @@ elif st.session_state.app_phase == "chatting":
             with st.chat_message("assistant"):
                 st.write(CRISIS_MESSAGE)
             st.session_state.history.append({"role": "assistant", "content": CRISIS_MESSAGE})
-            auto_save_to_google_sheets(force=True)
             st.rerun()
 
         with st.spinner("⏳ 教練傾聽中..."):
@@ -1048,8 +877,6 @@ elif st.session_state.app_phase == "chatting":
                 st.session_state.history.append({"role": "assistant", "content": resp_text})
 
                 maybe_update_memory()
-                auto_save_to_google_sheets(force=False)
-
                 st.rerun()
 
             except Exception as e:
@@ -1080,7 +907,6 @@ elif st.session_state.app_phase == "final_checkin":
             add_energy_score("後", final_score)
             maybe_update_memory(force=True)
             st.session_state.strengths_data = analyze_strengths()
-            auto_save_to_google_sheets(force=True)
 
         st.session_state.app_phase = "show_chart"
         st.rerun()
