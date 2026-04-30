@@ -1,452 +1,1233 @@
-import streamlit as st
-import pandas as pd
-import altair as alt
-import plotly.express as px
+import os
+import re
 import json
-from datetime import datetime, timedelta
-import google.generativeai as genai
-from google.generativeai.types import HarmCategory, HarmBlockThreshold
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
 import time
+import uuid
+from datetime import datetime, timedelta, timezone
 
-# --- 1. 系統設定 ---
-st.set_page_config(page_title="溫充電教練 (賦能雷達版)", layout="wide", page_icon="☕")
+import altair as alt
+import pandas as pd
+import plotly.express as px
+import streamlit as st
 
-# --- Google Sheets 背景自動上傳函式 ---
-def auto_save_to_google_sheets(user_id, chat_history, energy_log, strengths_data=None):
-    if not chat_history:
-        return False
+import google.generativeai as genai
+from google.generativeai.types import GenerationConfig, HarmCategory, HarmBlockThreshold
+
+import gspread
+from gspread.exceptions import WorksheetNotFound
+from oauth2client.service_account import ServiceAccountCredentials
+
+
+# =========================================================
+# 1. 系統設定
+# =========================================================
+st.set_page_config(
+    page_title="溫充電教練",
+    layout="wide",
+    page_icon="☕",
+)
+
+APP_TITLE = "☕ 溫充電教練"
+DEFAULT_MODEL_NAME = "gemini-2.5-flash-lite"
+MODEL_OPTIONS = ["gemini-2.5-flash-lite", "gemini-2.5-flash"]
+
+TAIPEI_TZ = timezone(timedelta(hours=8))
+
+RECENT_TURNS_FOR_CHAT = 10
+MEMORY_UPDATE_EVERY_MESSAGES = 8
+MAX_MEMORY_OUTPUT_TOKENS = 700
+MAX_CHAT_OUTPUT_TOKENS = 500
+MAX_STRENGTHS_OUTPUT_TOKENS = 500
+
+KEY_COOLDOWN_SECONDS = 60
+RETRY_WAIT_SECONDS = 60
+
+AUTOSAVE_MESSAGE_INTERVAL = 6
+AUTOSAVE_MIN_SECONDS = 45
+SHEET_CELL_CHAR_LIMIT = 45000
+
+DEFAULT_SPREADSHEET_NAME = "2025創傷知情研習數據"
+DEFAULT_WORKSHEET_NAME = "ChargeCoach"
+
+VIA_KEYS = ["智慧與知識", "勇氣", "人道", "正義", "節制", "超越"]
+
+SAFETY_SETTINGS = {
+    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+}
+
+
+# =========================================================
+# 2. 基礎工具
+# =========================================================
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def now_tw():
+    return utc_now().astimezone(TAIPEI_TZ)
+
+
+def format_tw(dt):
+    if not dt:
+        return ""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def safe_secret_get(section, default=None):
     try:
-        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-        creds_dict = dict(st.secrets["gcp_service_account"])
-        if "private_key" in creds_dict:
-            creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
-        
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-        client = gspread.authorize(creds)
-        sheet = client.open("2025創傷知情研習數據") 
-        
-        try:
-            worksheet = sheet.worksheet("ChargeCoach")
-        except gspread.WorksheetNotFound:
-            worksheet = sheet.add_worksheet(title="ChargeCoach", rows="1000", cols="10")
-            worksheet.append_row(["登入時間", "登出時間", "學員編號", "使用分鐘數", "能量變化", "完整對話紀錄"])
-        
-        tw_fix = timedelta(hours=8)
-        start_t = st.session_state.get('start_time', datetime.now())
-        login_str = (start_t + tw_fix).strftime("%Y-%m-%d %H:%M:%S")
-        logout_str = (datetime.now() + tw_fix).strftime("%Y-%m-%d %H:%M:%S")
-        duration_mins = round((datetime.now() - start_t).total_seconds() / 60, 2)
-        
+        return st.secrets.get(section, default)
+    except Exception:
+        return default
+
+
+def has_google_sheets_config():
+    try:
+        return "gcp_service_account" in st.secrets
+    except Exception:
+        return False
+
+
+def parse_api_keys(raw_value):
+    if not raw_value:
+        return []
+
+    if isinstance(raw_value, list):
+        return [str(k).strip() for k in raw_value if str(k).strip()]
+
+    return [k.strip() for k in re.split(r"[\n,]+", str(raw_value)) if k.strip()]
+
+
+def truncate_cell_text(text, limit=SHEET_CELL_CHAR_LIMIT):
+    text = str(text)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n\n...[內容過長，已截斷；完整紀錄請以使用者下載 JSON 為準]"
+
+
+def sanitize_filename(text):
+    text = str(text).strip() or "teacher"
+    return re.sub(r'[\\/:*?"<>|]+', "_", text)
+
+
+def clamp_score(value, low=1, high=10):
+    try:
+        num = float(value)
+    except Exception:
+        return None
+    return int(max(low, min(high, round(num))))
+
+
+# =========================================================
+# 3. Session State
+# =========================================================
+def default_state():
+    return {
+        "app_phase": "login",
+        "history": [],
+        "energy_log": [],
+        "strengths_data": {},
+        "user_nickname": "",
+        "start_time": utc_now(),
+        "session_id": str(uuid.uuid4()),
+        "api_keys_list": [],
+        "current_key_index": 0,
+        "key_cooldowns": {},
+        "valid_model_name": DEFAULT_MODEL_NAME,
+        "system_prompt": "",
+        "system_prompt_fallback": False,
+        "memory_summary": "",
+        "last_memory_update_len": 0,
+        "last_autosave_at": 0.0,
+        "last_autosave_message_count": 0,
+        "sheets_row_number": None,
+        "save_status": "",
+        "privacy_consent": False,
+    }
+
+
+def init_session_state():
+    for key, value in default_state().items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def reset_app(clear_keys=True):
+    managed_keys = list(default_state().keys())
+    widget_keys = [
+        "student_api_key_1",
+        "student_api_key_2",
+        "privacy_consent_checkbox",
+        "new_login",
+    ]
+
+    for key in managed_keys:
+        if key in st.session_state:
+            del st.session_state[key]
+
+    if clear_keys:
+        for key in widget_keys:
+            if key in st.session_state:
+                del st.session_state[key]
+
+    init_session_state()
+
+
+init_session_state()
+
+
+# =========================================================
+# 4. Google Sheets
+# =========================================================
+SHEET_HEADERS = [
+    "session_id",
+    "登入時間",
+    "最近儲存時間",
+    "學員編號",
+    "使用分鐘數",
+    "前測分數",
+    "後測分數",
+    "能量變化",
+    "VIA優勢JSON",
+    "對話摘要",
+    "完整紀錄JSON",
+]
+
+
+@st.cache_resource(show_spinner=False)
+def get_chargecoach_worksheet():
+    scope = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+
+    creds_dict = dict(st.secrets["gcp_service_account"])
+    if "private_key" in creds_dict:
+        creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    client = gspread.authorize(creds)
+
+    sheet_cfg = safe_secret_get("google_sheets", {}) or {}
+    spreadsheet_name = sheet_cfg.get("spreadsheet_name", DEFAULT_SPREADSHEET_NAME)
+    worksheet_name = sheet_cfg.get("worksheet_name", DEFAULT_WORKSHEET_NAME)
+
+    sheet = client.open(spreadsheet_name)
+
+    try:
+        worksheet = sheet.worksheet(worksheet_name)
+    except WorksheetNotFound:
+        worksheet = sheet.add_worksheet(
+            title=worksheet_name,
+            rows="2000",
+            cols=str(len(SHEET_HEADERS)),
+        )
+
+    header = worksheet.row_values(1)
+    if header != SHEET_HEADERS:
+        worksheet.update("A1:K1", [SHEET_HEADERS])
+
+    return worksheet
+
+
+def build_export_data():
+    return {
+        "app": "Warm Charge Coach",
+        "session_id": st.session_state.session_id,
+        "nickname": st.session_state.user_nickname,
+        "exported_at": format_tw(utc_now()),
+        "energy_log": st.session_state.energy_log,
+        "strengths_data": st.session_state.strengths_data,
+        "memory_summary": st.session_state.memory_summary,
+        "history": st.session_state.history,
+    }
+
+
+def auto_save_to_google_sheets(force=False):
+    if not has_google_sheets_config():
+        st.session_state.save_status = "未設定 Google Sheets，自動儲存已略過。"
+        return None
+
+    if not st.session_state.user_nickname:
+        return None
+
+    now_ts = time.time()
+    msg_count = len(st.session_state.history)
+
+    if not force:
+        enough_messages = msg_count - st.session_state.last_autosave_message_count >= AUTOSAVE_MESSAGE_INTERVAL
+        enough_time = now_ts - st.session_state.last_autosave_at >= AUTOSAVE_MIN_SECONDS
+        if not (enough_messages and enough_time):
+            return None
+
+    try:
+        worksheet = get_chargecoach_worksheet()
+
+        start_time = st.session_state.start_time
+        duration_mins = round((utc_now() - start_time).total_seconds() / 60, 2)
+
+        energy_log = st.session_state.energy_log
+        pre_score = energy_log[0]["分數"] if energy_log else ""
+        post_score = energy_log[-1]["分數"] if len(energy_log) >= 2 else ""
         energy_str = " -> ".join([f"{item['階段']}:{item['分數']}分" for item in energy_log])
-        
-        full_conversation = f"【能量走勢】：{energy_str}\n"
-        if strengths_data:
-            full_conversation += f"【優勢評估】：{strengths_data}\n"
-        full_conversation += "\n"
-        
-        for msg in chat_history:
-            role = msg.get("role", "Unknown")
-            content = msg.get("content", "")
-            full_conversation += f"[{role}]: {content}\n"
 
-        records = worksheet.get_all_records()
-        row_to_update = None
-        col_logins = worksheet.col_values(1) 
-        col_ids = worksheet.col_values(3)    
-        
-        for i in range(1, len(col_logins)): 
-            if i < len(col_ids) and col_logins[i] == login_str and str(col_ids[i]) == str(user_id):
-                row_to_update = i + 1 
-                break
-                
-        data_row = [login_str, logout_str, user_id, duration_mins, energy_str, full_conversation]
-        
-        if row_to_update:
-            worksheet.update(f'A{row_to_update}:F{row_to_update}', [data_row])
+        strengths_json = json.dumps(st.session_state.strengths_data, ensure_ascii=False)
+        full_json = json.dumps(build_export_data(), ensure_ascii=False, indent=2)
+
+        summary = st.session_state.memory_summary.strip()
+        if not summary:
+            recent = st.session_state.history[-12:]
+            summary = "\n".join([f"{m['role']}: {m['content']}" for m in recent])
+
+        data_row = [
+            st.session_state.session_id,
+            format_tw(start_time),
+            format_tw(utc_now()),
+            st.session_state.user_nickname,
+            duration_mins,
+            pre_score,
+            post_score,
+            energy_str,
+            strengths_json,
+            truncate_cell_text(summary, 12000),
+            truncate_cell_text(full_json),
+        ]
+
+        row_number = st.session_state.get("sheets_row_number")
+
+        if not row_number:
+            session_ids = worksheet.col_values(1)
+            for idx, value in enumerate(session_ids, start=1):
+                if value == st.session_state.session_id:
+                    row_number = idx
+                    break
+
+        if row_number and row_number > 1:
+            worksheet.update(f"A{row_number}:K{row_number}", [data_row])
         else:
-            worksheet.append_row(data_row)
+            worksheet.append_row(data_row, value_input_option="RAW")
+            st.session_state.sheets_row_number = len(worksheet.col_values(1))
+
+        st.session_state.last_autosave_at = now_ts
+        st.session_state.last_autosave_message_count = msg_count
+        st.session_state.save_status = "已自動儲存。"
         return True
+
     except Exception as e:
-        print(f"背景上傳失敗: {e}")
+        st.session_state.save_status = f"自動儲存失敗：{e}"
         return False
 
-# --- 背景 AI 優勢分析器 (Hidden Evaluator) ---
-def analyze_strengths(chat_history, active_key, model_name):
-    """在對話結束後，偷偷呼叫 AI 快速分析這段對話中的六大美德分數"""
+
+# =========================================================
+# 5. Gemini 呼叫與 API Key 輪替
+# =========================================================
+def get_current_api_key():
+    if not st.session_state.api_keys_list:
+        raise RuntimeError("尚未輸入 Gemini API Key。請在左側欄貼上自己的 API Key。")
+
+    if st.session_state.current_key_index >= len(st.session_state.api_keys_list):
+        st.session_state.current_key_index = 0
+
+    return st.session_state.api_keys_list[st.session_state.current_key_index]
+
+
+def mark_key_cooldown(index, seconds=KEY_COOLDOWN_SECONDS):
     try:
-        genai.configure(api_key=active_key)
-        model = genai.GenerativeModel(model_name=model_name)
-        
-        history_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in chat_history if msg['role'] != 'system'])
-        
-        prompt = f"""
-        你是一位正向心理學專家。請分析以下這段老師與教練的對話紀錄。
-        請嚴格根據 VIA 六大美德（智慧與知識、勇氣、人道、正義、節制、超越），
-        評估這位老師在面對教學挑戰與情緒調適的過程中所展現出的優勢強度。
-        請使用 1 到 10 分的量尺（10分為極高展現）。
-        
-        請「只」輸出純 JSON 格式，不要包含任何其他文字、引號或 Markdown 標記 (不要有 ```json)。
-        格式範例：
-        {{"智慧與知識": 8, "勇氣": 7, "人道": 9, "正義": 6, "節制": 7, "超越": 8}}
-        
-        【對話紀錄】：
-        {history_text}
-        """
-        response = model.generate_content(prompt)
-        result_text = response.text.strip().strip('`').replace('json\n', '')
-        strengths_dict = json.loads(result_text)
-        return strengths_dict
-    except Exception as e:
-        print(f"優勢分析失敗: {e}")
-        # 如果失敗，給一組溫暖的預設安慰分數避免當機 (統一使用精確名稱)
-        return {"智慧與知識": 7, "勇氣": 8, "人道": 8, "正義": 7, "節制": 6, "超越": 6}
+        key = st.session_state.api_keys_list[index]
+        st.session_state.key_cooldowns[key] = time.time() + seconds
+    except Exception:
+        pass
 
-# --- API 輪替與防呆發送機制 ---
-def send_message_safely(text):
-    time.sleep(1) 
-    system_prompt = st.session_state.history[0]["content"]
-    gemini_history = []
-    for msg in st.session_state.history[1:-1]:
-        g_role = "model" if msg["role"] == "assistant" else "user"
-        gemini_history.append({"role": g_role, "parts": [msg["content"]]})
-        
-    api_keys = st.session_state.api_keys_list
-    total_keys = len(api_keys)
-    
-    for i in range(total_keys):
-        current_key_index = (st.session_state.current_key_index + i) % total_keys
-        active_key = api_keys[current_key_index]
+
+def next_available_key_index(exclude=None):
+    exclude = exclude or set()
+    keys = st.session_state.api_keys_list
+    now = time.time()
+
+    for step in range(len(keys)):
+        idx = (st.session_state.current_key_index + step) % len(keys)
+        if idx in exclude:
+            continue
+        key = keys[idx]
+        if st.session_state.key_cooldowns.get(key, 0) <= now:
+            return idx
+
+    return None
+
+
+def seconds_until_next_key():
+    keys = st.session_state.api_keys_list
+    if not keys:
+        return RETRY_WAIT_SECONDS
+
+    now = time.time()
+    waits = [
+        max(0, st.session_state.key_cooldowns.get(key, 0) - now)
+        for key in keys
+    ]
+    waits = [w for w in waits if w > 0]
+    if not waits:
+        return 5
+    return int(min(max(min(waits), 5), RETRY_WAIT_SECONDS))
+
+
+def is_quota_error(err):
+    text = str(err).lower()
+    return any(x in text for x in ["429", "quota", "rate limit", "resource_exhausted"])
+
+
+def is_api_key_error(err):
+    text = str(err).lower()
+    return any(x in text for x in [
+        "api key not valid",
+        "invalid api key",
+        "api_key_invalid",
+        "permission_denied",
+        "403",
+    ])
+
+
+def build_model(temperature, max_output_tokens, system_instruction=None):
+    generation_config = GenerationConfig(
+        temperature=temperature,
+        max_output_tokens=max_output_tokens,
+    )
+
+    if system_instruction:
         try:
-            genai.configure(api_key=active_key)
-            model = genai.GenerativeModel(
+            st.session_state.system_prompt_fallback = False
+            return genai.GenerativeModel(
                 model_name=st.session_state.valid_model_name,
-                system_instruction=system_prompt,
-                safety_settings={
-                    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-                    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-                    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-                }
+                system_instruction=system_instruction,
+                generation_config=generation_config,
+                safety_settings=SAFETY_SETTINGS,
             )
-            chat_session = model.start_chat(history=gemini_history)
-            response = chat_session.send_message(text)
-            st.session_state.current_key_index = current_key_index
-            return response.text
-        except Exception as e:
-            error_msg = str(e).lower()
-            st.toast(f"⚠️ Key {current_key_index + 1} 發生狀況，切換中...", icon="🔄")
-            if i == total_keys - 1:
-                if "429" in error_msg or "quota" in error_msg:
-                    st.warning("🐌 您輸入的速度太快了。請稍等 1 分鐘後再試！")
-                    return None
-                else:
-                    raise e
+        except TypeError:
+            st.session_state.system_prompt_fallback = True
 
-# 初始化 Session State
-if "app_phase" not in st.session_state: st.session_state.app_phase = "login"
-if "history" not in st.session_state: st.session_state.history = []
-if "energy_log" not in st.session_state: st.session_state.energy_log = []
-if "strengths_data" not in st.session_state: st.session_state.strengths_data = {}
-if "user_nickname" not in st.session_state: st.session_state.user_nickname = ""
-if "start_time" not in st.session_state: st.session_state.start_time = datetime.now()
-if "raw_api_key_input" not in st.session_state: st.session_state.raw_api_key_input = ""
-if "api_keys_list" not in st.session_state: st.session_state.api_keys_list = []
-if "current_key_index" not in st.session_state: st.session_state.current_key_index = 0
-if "valid_model_name" not in st.session_state: st.session_state.valid_model_name = "gemini-2.5-flash"
+    return genai.GenerativeModel(
+        model_name=st.session_state.valid_model_name,
+        generation_config=generation_config,
+        safety_settings=SAFETY_SETTINGS,
+    )
 
-def reset_app():
-    st.session_state.app_phase = "login"
-    st.session_state.history = []
-    st.session_state.energy_log = []
-    st.session_state.strengths_data = {}
-    st.session_state.user_nickname = "" 
-    st.session_state.start_time = datetime.now()
 
-# --- 側邊欄 ---
-if st.session_state.user_nickname:
-    st.sidebar.title(f"👤 {st.session_state.user_nickname}")
-    if st.sidebar.button("🔄 重新開始 / 切換帳號", type="secondary"):
-        reset_app()
-        st.rerun()
-    st.sidebar.markdown("---")
+def extract_response_text(resp):
+    try:
+        text = resp.text
+        if text and text.strip():
+            return text.strip()
+    except Exception:
+        pass
 
-st.sidebar.warning("🔑 請輸入 Gemini API Key")
-input_key = st.sidebar.text_input("貼上 API Key (可用逗號隔開多組)", type="password", value=st.session_state.raw_api_key_input)
-if input_key:
-    st.session_state.raw_api_key_input = input_key
-    st.session_state.api_keys_list = [k.strip() for k in input_key.split(",") if k.strip()]
+    try:
+        candidates = getattr(resp, "candidates", []) or []
+        parts = candidates[0].content.parts
+        text = "\n".join(getattr(p, "text", "") for p in parts if getattr(p, "text", ""))
+        if text.strip():
+            return text.strip()
+    except Exception:
+        pass
 
+    feedback = getattr(resp, "prompt_feedback", "")
+    raise RuntimeError(f"模型沒有回傳可用文字。{feedback}")
+
+
+def call_gemini_with_failover(task_fn, purpose="AI生成"):
+    if not st.session_state.api_keys_list:
+        raise RuntimeError("尚未輸入 Gemini API Key。")
+
+    waited_once = False
+    last_error = None
+
+    while True:
+        attempted = set()
+
+        for _ in range(len(st.session_state.api_keys_list)):
+            idx = next_available_key_index(exclude=attempted)
+            if idx is None:
+                break
+
+            attempted.add(idx)
+            active_key = st.session_state.api_keys_list[idx]
+
+            try:
+                genai.configure(api_key=active_key)
+                result = task_fn(active_key)
+                st.session_state.current_key_index = idx
+                return result
+
+            except Exception as e:
+                last_error = e
+
+                if is_quota_error(e):
+                    mark_key_cooldown(idx, KEY_COOLDOWN_SECONDS)
+                    st.toast(f"{purpose}：第 {idx + 1} 組 Key 暫時滿載，切換中。", icon="🔄")
+                    st.session_state.current_key_index = (idx + 1) % len(st.session_state.api_keys_list)
+                    continue
+
+                if is_api_key_error(e):
+                    mark_key_cooldown(idx, 3600)
+                    st.toast(f"{purpose}：第 {idx + 1} 組 Key 可能無效，嘗試下一組。", icon="⚠️")
+                    st.session_state.current_key_index = (idx + 1) % len(st.session_state.api_keys_list)
+                    continue
+
+                raise e
+
+        if last_error and is_api_key_error(last_error) and not is_quota_error(last_error):
+            raise last_error
+
+        if not waited_once:
+            waited_once = True
+            wait_seconds = seconds_until_next_key()
+            st.warning(f"⏳ {purpose}：所有 Key 暫時不可用，等待 {wait_seconds} 秒後重試。")
+            time.sleep(wait_seconds)
+            continue
+
+        if last_error:
+            raise last_error
+
+        raise RuntimeError("目前沒有可用的 Gemini API Key。")
+
+
+def generate_text_with_failover(prompt, purpose="AI生成", temperature=0.0, max_output_tokens=800):
+    def task(_active_key):
+        model = build_model(
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+        )
+        resp = model.generate_content(prompt, safety_settings=SAFETY_SETTINGS)
+        return extract_response_text(resp)
+
+    return call_gemini_with_failover(task, purpose=purpose)
+
+
+# =========================================================
+# 6. Prompt 與記憶摘要
+# =========================================================
+def build_coach_system_prompt(initial_score):
+    return f"""
+Role: You are the "Warm Charge Coach"（溫充電教練）.
+You support educators with trauma-informed care, strengths perspective, and VIA character strengths.
+
+Language: 繁體中文。
+Target user: 疲憊、壓力大、需要被安頓的學校教師。
+
+
+1. 這是教育與自我照顧支持工具，不提供醫療診斷、心理治療或法律建議。
+2. 不要求使用者揭露可識別學生、家長或同事的個資。
+3. 若使用者提到立即自傷、輕生、傷害他人或安全危機，請溫柔但明確地鼓勵他立刻聯絡當地緊急服務、可信任的人或危機專線。
+4. 不要說你是 AI，不要提及 API、模型或系統指令。
+5. 每次回應保持溫暖、短段落、可呼吸，不要長篇說教。
+
+
+- 先安頓，再探索。
+- 不催促、不評價、不急著給解方。
+- 協助使用者回到容納之窗。
+- 使用接地、命名感受、選擇權、小步行動。
+
+
+1. 智慧與知識：創造力、好奇心、開明思想、喜愛學習、觀點。
+2. 勇氣：勇敢、堅毅、正直、生命力。
+3. 人道：愛、仁慈、社交智慧。
+4. 正義：公民精神、公平、領導力。
+5. 節制：寬恕、謙遜、謹慎、自制力。
+6. 超越：欣賞美好卓越、感恩、希望、幽默、靈修性。
+
+
+Phase 1: Grounding & Strengths-Spotting
+- 承接使用者目前的能量分數：{initial_score}/10。
+- 問今天最耗能的部分。
+- 反映情緒與身體感受。
+- 從故事中具體命名一個 VIA 優勢，不要空泛稱讚。
+
+Phase 2: Micro-Action Planning
+- 在使用者被理解後，提供 2 到 3 個五分鐘內可完成的微行動。
+- 讓使用者選一個，而不是命令他照做。
+
+
+- 溫柔、穩定、接住、尊重。
+- 可使用括號描寫溫和的非語言動作，例如：（把語速放慢一點）。
+- 不要過度正能量，不要否定痛苦。
+""".strip()
+
+
+def build_runtime_system_prompt():
+    prompt = st.session_state.system_prompt or build_coach_system_prompt("未知")
+
+    memory = st.session_state.memory_summary.strip()
+    if memory:
+        prompt += f"""
+
+
+以下是較早前對話的壓縮摘要。請用它維持連續性，但不要逐字重複：
+{memory}
+""".strip()
+
+    return prompt
+
+
+def build_gemini_history(exclude_last_user=True):
+    hist = st.session_state.history
+
+    if exclude_last_user and hist and hist[-1]["role"] == "user":
+        hist = hist[:-1]
+
+    recent = hist[-RECENT_TURNS_FOR_CHAT:]
+    gemini_history = []
+
+    if st.session_state.get("system_prompt_fallback"):
+        gemini_history.append({
+            "role": "user",
+            "parts": [build_runtime_system_prompt()],
+        })
+        gemini_history.append({
+            "role": "model",
+            "parts": ["我會以溫充電教練的角色，溫柔而穩定地陪伴。"],
+        })
+
+    for msg in recent:
+        role = "model" if msg.get("role") == "assistant" else "user"
+        content = str(msg.get("content", "")).strip()
+        if content:
+            gemini_history.append({"role": role, "parts": [content]})
+
+    return gemini_history
+
+
+def send_message_safely(user_text):
+    def task(_active_key):
+        model = build_model(
+            temperature=0.5,
+            max_output_tokens=MAX_CHAT_OUTPUT_TOKENS,
+            system_instruction=build_runtime_system_prompt(),
+        )
+        chat_session = model.start_chat(history=build_gemini_history(exclude_last_user=True))
+        resp = chat_session.send_message(user_text)
+        return extract_response_text(resp)
+
+    return call_gemini_with_failover(task, purpose="教練回應")
+
+
+def format_history_for_prompt(messages):
+    lines = []
+    for msg in messages:
+        role = "老師" if msg.get("role") == "user" else "教練"
+        content = str(msg.get("content", "")).strip()
+        if content:
+            lines.append(f"{role}: {content}")
+    return "\n".join(lines)
+
+
+def maybe_update_memory(force=False):
+    hist = st.session_state.history
+
+    if len(hist) < RECENT_TURNS_FOR_CHAT + MEMORY_UPDATE_EVERY_MESSAGES and not force:
+        return
+
+    summary_until = max(0, len(hist) - RECENT_TURNS_FOR_CHAT)
+    last_len = int(st.session_state.get("last_memory_update_len", 0))
+
+    if summary_until <= last_len and not force:
+        return
+
+    delta_hist = hist[last_len:summary_until] if not force else hist[:-RECENT_TURNS_FOR_CHAT]
+
+    if not delta_hist:
+        return
+
+    prompt = f"""
+請把以下「老師與溫充電教練」的對話壓縮成後續可用的溫柔記憶摘要。
+
+請保留：
+1. 老師目前主要壓力來源；
+2. 情緒與身體狀態；
+3. 已經展現的 VIA 優勢；
+4. 曾提過可行或不可行的自我照顧方式；
+5. 後續陪伴時需要避免踩到的點。
+
+請不要評分。
+請不要寫成督導報告。
+請用 350 字以內繁體中文摘要。
+
+
+{st.session_state.memory_summary}
+
+
+{format_history_for_prompt(delta_hist)}
+""".strip()
+
+    try:
+        summary = generate_text_with_failover(
+            prompt,
+            purpose="壓縮對話記憶",
+            temperature=0.0,
+            max_output_tokens=MAX_MEMORY_OUTPUT_TOKENS,
+        )
+        st.session_state.memory_summary = summary.strip()
+        st.session_state.last_memory_update_len = summary_until
+    except Exception:
+        pass
+
+
+# =========================================================
+# 7. VIA 優勢分析
+# =========================================================
+def extract_json_object(text):
+    text = str(text).strip()
+    text = text.replace("```json", "").replace("```", "").strip()
+
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    match = re.search(r"\{.*\}", text, flags=re.S)
+    if not match:
+        raise ValueError("找不到 JSON 物件。")
+
+    return json.loads(match.group(0))
+
+
+def parse_strengths_result(text):
+    data = extract_json_object(text)
+    parsed = {}
+
+    for key in VIA_KEYS:
+        raw_val = data.get(key)
+
+        if isinstance(raw_val, str):
+            num_match = re.search(r"\d+(\.\d+)?", raw_val)
+            raw_val = num_match.group(0) if num_match else None
+
+        score = clamp_score(raw_val, 1, 10)
+        if score is None:
+            raise ValueError(f"{key} 分數無法解析。")
+
+        parsed[key] = score
+
+    return parsed
+
+
+def build_strengths_analysis_text():
+    recent = st.session_state.history[-40:]
+    parts = []
+
+    if st.session_state.memory_summary:
+        parts.append(f"\n{st.session_state.memory_summary}")
+
+    parts.append(f"\n{format_history_for_prompt(recent)}")
+    return "\n\n".join(parts)
+
+
+def analyze_strengths():
+    prompt = f"""
+你是一位正向心理學與教師支持工作專家。請根據以下老師與教練的對話，
+評估老師在面對教學挑戰、壓力與情緒調適過程中展現出的 VIA 六大美德強度。
+
+請只輸出純 JSON，不要 Markdown，不要說明文字。
+
+六個鍵必須完全使用以下名稱：
+{", ".join(VIA_KEYS)}
+
+每個值請使用 1 到 10 的整數。
+10 表示非常明顯展現，1 表示幾乎沒有觀察到。
+
+格式範例：
+{{"智慧與知識": 8, "勇氣": 7, "人道": 9, "正義": 6, "節制": 7, "超越": 8}}
+
+
+{build_strengths_analysis_text()}
+""".strip()
+
+    try:
+        result_text = generate_text_with_failover(
+            prompt,
+            purpose="VIA 優勢分析",
+            temperature=0.0,
+            max_output_tokens=MAX_STRENGTHS_OUTPUT_TOKENS,
+        )
+        return parse_strengths_result(result_text)
+    except Exception as e:
+        st.warning(f"VIA 優勢分析暫時失敗：{e}")
+        return {}
+
+
+# =========================================================
+# 8. 危機偵測
+# =========================================================
+CRISIS_KEYWORDS = [
+    "想死", "自殺", "輕生", "不想活", "活不下去", "結束生命",
+    "傷害自己", "自殘", "割腕", "跳樓", "吃藥死", "殺了自己",
+    "傷害別人", "殺人", "想殺", "報復",
+]
+
+CRISIS_MESSAGE = """
+（我先把語速放慢，也把這件事看得很重要。）
+
+我聽見你現在可能已經不只是累，而是有安全上的風險了。這一刻請不要一個人撐著。
+
+如果你有立即傷害自己或他人的可能，請現在就聯絡當地緊急服務，或請身邊可信任的人陪你一起處理。若你在台灣，可以撥打 119 或 110；也可以聯絡 1925 安心專線、1995 生命線、1980 張老師專線。
+
+你不需要把所有事情一次說清楚。現在最重要的是：先讓一個真人知道你正在危險或快撐不住。
+""".strip()
+
+
+def detect_crisis(text):
+    text = str(text)
+    return any(keyword in text for keyword in CRISIS_KEYWORDS)
+
+
+# =========================================================
+# 9. UI 小元件
+# =========================================================
+def render_window_reference():
+    st.markdown("""
+**💡 容納之窗參考指標**
+
+- **8~10 分（紅區）**：過度激發，例如焦慮、煩躁、恐慌、想發脾氣。
+- **4~7 分（綠區）**：容納之窗，例如平靜、安全、能自我調節。
+- **0~3 分（藍區）**：過低激發，例如疲憊、無力、麻木、大腦當機。
+""")
+
+
+def add_energy_score(suffix, score):
+    today_str = now_tw().strftime("%m/%d")
+    st.session_state.energy_log.append({
+        "階段": f"{today_str} {suffix}",
+        "分數": int(score),
+        "排序": len(st.session_state.energy_log) + 1,
+        "時間": now_tw().isoformat(),
+    })
+
+
+def get_state_message(score):
+    if score >= 8:
+        return "看到您剛剛標記的狀態落在比較焦慮、煩躁的紅區。辛苦您了，現在的神經系統可能很緊繃。"
+    if score <= 3:
+        return "看到您剛剛標記的狀態落在比較疲憊、無力的藍區。辛苦您了，今天可能已經耗掉很多心力。"
+    return "看到您剛剛標記的狀態落在相對平穩的綠區，這是一個可以慢慢整理自己的起點。"
+
+
+# =========================================================
+# 10. 側邊欄
+# =========================================================
+st.sidebar.title("⚙️ 系統設定")
+
+st.sidebar.subheader("🔑 Gemini API Key")
+st.sidebar.caption("請使用者貼上自己的 Gemini API Key。Key 只會暫存在本次 session，不會寫進下載檔或 Google Sheets。")
+
+student_key_1 = st.sidebar.text_input(
+    "Gemini API Key 1",
+    type="password",
+    key="student_api_key_1",
+)
+
+student_key_2 = st.sidebar.text_input(
+    "Gemini API Key 2（選填）",
+    type="password",
+    key="student_api_key_2",
+)
+
+st.session_state.api_keys_list = parse_api_keys([student_key_1, student_key_2])
 has_api_key = len(st.session_state.api_keys_list) > 0
 
 if has_api_key:
-    try:
-        genai.configure(api_key=st.session_state.api_keys_list[0])
-        available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        if available_models:
-            default_idx = available_models.index("models/gemini-2.5-flash") if "models/gemini-2.5-flash" in available_models else 0
-            st.session_state.valid_model_name = st.sidebar.selectbox("🤖 AI 模型", available_models, index=default_idx)
-    except: 
-        st.sidebar.error("❌ API Key 無效")
+    if st.session_state.current_key_index >= len(st.session_state.api_keys_list):
+        st.session_state.current_key_index = 0
+    st.sidebar.success(f"已輸入 {len(st.session_state.api_keys_list)} 組 API Key。")
+    st.sidebar.caption(f"目前使用：第 {st.session_state.current_key_index + 1} / {len(st.session_state.api_keys_list)} 組")
 else:
-    st.sidebar.info("💡 提示：請在此輸入 API Key 以解鎖系統。")
+    st.sidebar.warning("請先輸入至少 1 組 Gemini API Key。")
 
-# ==========================================
-# 畫面流程控制
-# ==========================================
-st.title("☕ 溫充電教練 (動態互動版)")
+st.sidebar.selectbox(
+    "🤖 AI 模型",
+    MODEL_OPTIONS,
+    index=MODEL_OPTIONS.index(st.session_state.valid_model_name)
+    if st.session_state.valid_model_name in MODEL_OPTIONS else 0,
+    key="valid_model_name",
+)
 
-# 【階段 1】：登入與讀取畫面
+st.sidebar.markdown("---")
+
+if has_google_sheets_config():
+    st.sidebar.success("Google Sheets 自動儲存：已啟用")
+else:
+    st.sidebar.info("Google Sheets 自動儲存：未設定")
+
+if st.session_state.save_status:
+    st.sidebar.caption(st.session_state.save_status)
+
+if st.session_state.user_nickname:
+    st.sidebar.markdown("---")
+    st.sidebar.write(f"👤 使用者：**{st.session_state.user_nickname}**")
+
+    if st.sidebar.button("🔄 重新開始 / 切換使用者"):
+        reset_app(clear_keys=True)
+        st.rerun()
+
+
+# =========================================================
+# 11. 主畫面
+# =========================================================
+st.title(APP_TITLE)
+
+# ------------------------------
+# 階段 1：登入
+# ------------------------------
 if st.session_state.app_phase == "login":
     st.markdown("### 先顧好自己，AI 才能幫上忙。")
+
     if not has_api_key:
-        st.warning("⚠️ 系統尚未連線：請先在左側邊欄輸入您的「API Key」來解鎖充電站大門喔！")
-        
-    tab1, tab2 = st.tabs(["✨ 新的充電", "📂 載入過去紀錄 (延續走勢)"])
-    
+        st.warning("⚠️ 請先在左側邊欄輸入自己的 Gemini API Key。")
+
+    with st.expander("資料使用與隱私提醒", expanded=True):
+        st.markdown("""
+本工具可能會記錄您的稱呼、使用時間、能量分數、對話內容與 VIA 優勢分析，供研習或自我照顧紀錄使用。
+
+請避免輸入可識別學生、家長、同事或學校個案的個人資料。  
+若內容涉及立即安全風險，請優先聯絡真人支持與緊急資源。
+""")
+
+        st.checkbox(
+            "我了解上述提醒，並同意在此工具中進行自我照顧練習。",
+            key="privacy_consent_checkbox",
+        )
+        st.session_state.privacy_consent = bool(st.session_state.privacy_consent_checkbox)
+
+    tab1, tab2 = st.tabs(["✨ 新的充電", "📂 載入過去紀錄"])
+
+    can_enter = has_api_key and st.session_state.privacy_consent
+
     with tab1:
-        nickname_input = st.text_input("請輸入您的稱呼：", placeholder="例如：大業國小王老師", disabled=not has_api_key, key="new_login") 
-        if st.button("🚀 進入充電站", type="primary", disabled=not has_api_key):
+        nickname_input = st.text_input(
+            "請輸入您的稱呼：",
+            placeholder="例如：大業國小王老師",
+            disabled=not can_enter,
+            key="new_login",
+        )
+
+        if st.button("🚀 進入充電站", type="primary", disabled=not can_enter):
             if nickname_input.strip():
-                st.session_state.user_nickname = nickname_input
+                st.session_state.user_nickname = nickname_input.strip()
+                st.session_state.start_time = utc_now()
+                st.session_state.session_id = str(uuid.uuid4())
                 st.session_state.app_phase = "initial_checkin"
                 st.rerun()
             else:
-                st.error("❌ 稱呼不能為空！")
-                
+                st.error("❌ 稱呼不能為空。")
+
     with tab2:
-        st.info("上傳您過去專屬的「充電紀錄 (.json)」，教練會為您延續跨日的能量走勢圖！")
-        uploaded_file = st.file_uploader("上傳您的充電紀錄", type=['json'], disabled=not has_api_key)
-        if uploaded_file is not None and has_api_key:
+        st.info("上傳先前下載的「充電記憶 JSON」，教練會延續能量走勢與摘要記憶。")
+
+        uploaded_file = st.file_uploader(
+            "上傳您的充電紀錄",
+            type=["json"],
+            disabled=not can_enter,
+        )
+
+        if uploaded_file is not None and can_enter:
             try:
                 data = json.load(uploaded_file)
+
                 if "history" in data and "energy_log" in data:
-                    st.success(f"✅ 成功喚醒記憶！歡迎回來，{data.get('nickname', '老師')}。")
+                    st.success(f"✅ 成功讀取紀錄。歡迎回來，{data.get('nickname', '老師')}。")
+
                     if st.button("🚀 繼續今日充電", type="primary"):
                         st.session_state.user_nickname = data.get("nickname", "老師")
-                        st.session_state.history = data["history"]
-                        st.session_state.energy_log = data["energy_log"]
-                        st.session_state.strengths_data = data.get("strengths_data", {}) 
-                        st.session_state.start_time = datetime.now() 
+                        st.session_state.history = data.get("history", [])
+                        st.session_state.energy_log = data.get("energy_log", [])
+                        st.session_state.strengths_data = data.get("strengths_data", {})
+                        st.session_state.memory_summary = data.get("memory_summary", "")
+                        st.session_state.start_time = utc_now()
+                        st.session_state.session_id = str(uuid.uuid4())
                         st.session_state.app_phase = "initial_checkin"
                         st.rerun()
                 else:
-                    st.error("❌ 檔案格式不正確，找不到紀錄。")
-            except Exception as e:
-                st.error(f"❌ 讀取失敗: {e}")
+                    st.error("❌ 檔案格式不正確，找不到必要紀錄。")
 
-# 【階段 2】：開始前測
+            except Exception as e:
+                st.error(f"❌ 讀取失敗：{e}")
+
+
+# ------------------------------
+# 階段 2：開始前測
+# ------------------------------
 elif st.session_state.app_phase == "initial_checkin":
-    st.info(f"歡迎您，{st.session_state.user_nickname}！在開始對話前，請先感受一下現在的身心狀態。")
-    
-    st.markdown("""
-    **💡 容納之窗參考指標：**
-    * **8~10分 (紅區)**：過度激患 (焦慮、煩躁、恐慌、想發脾氣)
-    * **4~7分 (綠區)**：容納之窗 (平靜、安全、能自我調節)
-    * **0~3分 (藍區)**：過低激患 (疲憊、無力、麻木、大腦當機)
-    """)
-    
+    if not has_api_key:
+        st.error("❌ API Key 已清空，請在左側欄重新輸入。")
+        st.stop()
+
+    st.info(f"歡迎您，{st.session_state.user_nickname}。在開始對話前，先感受一下現在的身心狀態。")
+    render_window_reference()
+
     initial_score = st.slider("👉 您現在的能量落在哪個區間？", 0, 10, 5)
-    
+
     if st.button("💾 記錄並開始對話", type="primary"):
-        today_str = (datetime.now() + timedelta(hours=8)).strftime("%m/%d")
-        phase_name = f"{today_str} 前"
-        st.session_state.energy_log.append({"階段": phase_name, "分數": initial_score, "排序": len(st.session_state.energy_log) + 1})
-        
-        # 將您指定的 VIA 核心意涵與詞彙完美整合進 Prompt
-        sys_prompt = f"""
-        Role: You are the "Warm Charge Coach" (溫充電教練), an AI assistant designed specifically for educators to practice self-care based on Trauma-Informed Care (TIC) and the Strengths Perspective.
-        Target Audience: A stressed or tired school teacher.
-        Language: 繁體中文.
-        
-        [CORE PHILOSOPHY]
-        1. **Trauma-Informed:** You understand the "Window of Tolerance". Do not judge, rush, or immediately offer solutions. Help the teacher ground.
-        2. **Strengths-Based (VIA Character Strengths):** Actively listen for the teacher's virtues and 24 character strengths. EXPLICITLY name these strengths when you reflect their efforts.
-        
-        【嚴格遵守之 VIA 六大美德與 24 項優勢定義】：
-        VIA六大美德與24項優勢是正向心理學的核心概念。請您在與老師對話時，嚴格使用以下詞彙來賦能老師：
-        1. 智慧與知識 (Wisdom and Knowledge)：創造力、好奇心、開明思想、喜愛學習、觀點。
-        2. 勇氣 (Courage)：勇敢、堅毅、正直、生命力。
-        3. 人道 (Humanity)：愛、仁慈、社交智慧。
-        4. 正義 (Justice)：公民精神、公平、領導力。
-        5. 節制 (Temperance)：寬恕、謙遜、謹慎、自制力。
-        6. 超越 (Transcendence)：欣賞美好卓越、感恩、希望、幽默、靈修性。
-        
-        [INTERACTION PHASES]
-        **Phase 1: Grounding & Strengths-Spotting (著陸與探勘)**
-        - Start by acknowledging their current self-reported state. 
-        - Ask what was the most draining part of their day.
-        - Reflect back a specific VIA character strength you noticed in their story (e.g., "我看到你在那一個充滿挑戰的時刻，展現了極大的『節制』與『人道』精神...").
-        
-        **Phase 2: Micro-Action Planning (微行動計畫)**
-        - Offer 3 highly specific, extremely small "Micro-Actions" (taking less than 5 minutes) they can do today to recharge.
-        - Let them choose one.
-        
-        [TONE & STYLE]
-        - Warm, validating, deeply empathetic.
-        - Use short paragraphs. 
-        - Use parentheses ( ) to describe your own gentle, non-verbal behaviors.
-        - Do not explain you are an AI.
-        """
-        
-        if initial_score >= 8:
-            state_msg = "看到您剛剛標記的狀態落在比較焦慮、煩躁的紅區。辛苦您了，現在的神經系統一定很緊繃吧。"
-        elif initial_score <= 3:
-            state_msg = "看到您剛剛標記的狀態落在比較疲憊、無力的藍區。辛苦您了，今天一定耗費了非常多心神吧。"
-        else:
-            state_msg = "看到您剛剛標記的狀態落在相對平穩的綠區，這是一個很好的開始。"
-            
+        add_energy_score("前", initial_score)
+        st.session_state.system_prompt = build_coach_system_prompt(initial_score)
+
+        state_msg = get_state_message(initial_score)
+
         if len(st.session_state.history) == 0:
-            welcome_msg = f"(為您拉開一張舒適的椅子，倒了一杯溫水)\n\n{state_msg}\n\n這裡非常安全，沒有人會評價您。今天讓您感到最耗能、最辛苦的事情是什麼呢？願意跟我分享嗎？"
+            welcome_msg = f"""（為您拉開一張舒適的椅子，也把語速放慢一點。）
+
+{state_msg}
+
+這裡不需要表現得很好，也沒有人會評價您。今天最耗能、最辛苦的事情是什麼呢？如果願意，我們可以從一小段開始。"""
+
             st.session_state.history = [
-                {"role": "user", "content": sys_prompt}, 
-                {"role": "user", "content": "教練，我準備好要開始充電了。"}, 
                 {"role": "assistant", "content": welcome_msg}
             ]
-        else:
-            resume_welcome_msg = f"(為您拉開一張舒適的椅子，倒了一杯溫水)\n\n歡迎回來！{state_msg}\n\n距離我們上次聊聊又過了一陣子，今天過得好嗎？有什麼最讓您感到耗能的事情，願意跟我分享嗎？"
-            st.session_state.history.append({"role": "user", "content": f"[系統提示：這是新的一天。使用者登入自評能量為 {initial_score} 分。請接續過去的記憶，關懷使用者今天的狀況。]"})
-            st.session_state.history.append({"role": "assistant", "content": resume_welcome_msg})
 
+        else:
+            if not st.session_state.memory_summary and len(st.session_state.history) > RECENT_TURNS_FOR_CHAT:
+                with st.spinner("正在整理先前記憶..."):
+                    maybe_update_memory(force=True)
+
+            resume_msg = f"""（重新為您倒一杯溫水。）
+
+歡迎回來。{state_msg}
+
+距離上次聊聊又過了一段時間。今天的你，最需要先被接住的是哪一部分呢？"""
+
+            st.session_state.history.append({"role": "assistant", "content": resume_msg})
+
+        auto_save_to_google_sheets(force=True)
         st.session_state.app_phase = "chatting"
         st.rerun()
 
-# 【階段 3】：對話中
+
+# ------------------------------
+# 階段 3：對話中
+# ------------------------------
 elif st.session_state.app_phase == "chatting":
-    
+    if not has_api_key:
+        st.error("❌ API Key 已清空，請在左側欄重新輸入。")
+        st.stop()
+
     col1, col2 = st.columns([4, 1])
     with col2:
-        if st.button("🏁 結束對話，查看能量走勢", help="點擊此按鈕結束本次充電，並生成走勢圖"):
+        if st.button("🏁 結束對話", help="結束本次充電並進行後測"):
             st.session_state.app_phase = "final_checkin"
             st.rerun()
 
-    for msg in st.session_state.history:
-        role = "assistant" if msg["role"] == "assistant" else "user"
-        if "Role: You are the" not in msg["content"] and "[系統提示" not in msg["content"] and "準備好要開始" not in msg["content"]:
-            with st.chat_message(role):
-                st.write(msg["content"])
+    if st.session_state.memory_summary:
+        with st.expander("🧠 教練的壓縮記憶", expanded=False):
+            st.write(st.session_state.memory_summary)
 
-    if user_in := st.chat_input("分享您的感受... (可用括號描述動作)"):
+    visible_history = st.session_state.history[-80:]
+    if len(st.session_state.history) > 80:
+        st.info("目前畫面僅顯示最近 80 則訊息；完整紀錄仍會保留在下載檔。")
+
+    for msg in visible_history:
+        role = "assistant" if msg["role"] == "assistant" else "user"
+        with st.chat_message(role):
+            st.write(msg["content"])
+
+    if user_in := st.chat_input("分享您的感受..."):
         st.session_state.history.append({"role": "user", "content": user_in})
+
         with st.chat_message("user"):
             st.write(user_in)
-            
+
+        if detect_crisis(user_in):
+            with st.chat_message("assistant"):
+                st.write(CRISIS_MESSAGE)
+            st.session_state.history.append({"role": "assistant", "content": CRISIS_MESSAGE})
+            auto_save_to_google_sheets(force=True)
+            st.rerun()
+
         with st.spinner("⏳ 教練傾聽中..."):
             try:
                 resp_text = send_message_safely(user_in)
-                if resp_text: 
-                    st.session_state.history.append({"role": "assistant", "content": resp_text})
-                    auto_save_to_google_sheets(st.session_state.user_nickname, st.session_state.history, st.session_state.energy_log)
-                    st.rerun()
-            except Exception as e:
-                st.error(f"❌ 發生錯誤: {e}")
+                st.session_state.history.append({"role": "assistant", "content": resp_text})
 
-# 【階段 4】：結束後測
+                maybe_update_memory()
+                auto_save_to_google_sheets(force=False)
+
+                st.rerun()
+
+            except Exception as e:
+                st.error(f"❌ 發生錯誤：{e}")
+
+    st.caption(
+        f"完整紀錄目前 {len(st.session_state.history)} 則；"
+        f"實際送給 Gemini 的內容會控制在摘要記憶 + 最近 {RECENT_TURNS_FOR_CHAT} 則對話。"
+    )
+
+
+# ------------------------------
+# 階段 4：結束後測
+# ------------------------------
 elif st.session_state.app_phase == "final_checkin":
+    if not has_api_key:
+        st.error("❌ API Key 已清空，請在左側欄重新輸入。")
+        st.stop()
+
     st.markdown("### 🏁 梳理完畢，您現在感覺如何？")
     st.info("經過剛剛的梳理與對話，請再次評估您現在的神經系統狀態。")
-    
-    st.markdown("""
-    **💡 容納之窗參考指標：**
-    * **8~10分 (紅區)**：過度激患 (焦慮、煩躁、恐慌、想發脾氣)
-    * **4~7分 (綠區)**：容納之窗 (平靜、安全、能自我調節)
-    * **0~3分 (藍區)**：過低激患 (疲憊、無力、麻木、大腦當機)
-    """)
-    
+    render_window_reference()
+
     final_score = st.slider("👉 對話後的能量區間：", 0, 10, 5)
-    
-    if st.button("📊 生成我的專屬能量與優勢雷達圖", type="primary"):
-        with st.spinner("✨ 教練正在為您繪製專屬的「能量軌跡」與「六大美德雷達圖」，請稍候..."):
-            today_str = (datetime.now() + timedelta(hours=8)).strftime("%m/%d")
-            phase_name = f"{today_str} 後"
-            st.session_state.energy_log.append({"階段": phase_name, "分數": final_score, "排序": len(st.session_state.energy_log) + 1})
-            
-            active_key = st.session_state.api_keys_list[st.session_state.current_key_index]
-            strengths_data = analyze_strengths(st.session_state.history, active_key, st.session_state.valid_model_name)
-            st.session_state.strengths_data = strengths_data
-            
-            auto_save_to_google_sheets(st.session_state.user_nickname, st.session_state.history, st.session_state.energy_log, st.session_state.strengths_data)
-            
+
+    if st.button("📊 生成我的能量走勢與優勢雷達圖", type="primary"):
+        with st.spinner("✨ 正在整理能量軌跡與 VIA 六大美德雷達圖..."):
+            add_energy_score("後", final_score)
+            maybe_update_memory(force=True)
+            st.session_state.strengths_data = analyze_strengths()
+            auto_save_to_google_sheets(force=True)
+
         st.session_state.app_phase = "show_chart"
         st.rerun()
 
-# 【階段 5】：顯示動態走勢圖、優勢雷達圖與下載
+
+# ------------------------------
+# 階段 5：顯示圖表與下載
+# ------------------------------
 elif st.session_state.app_phase == "show_chart":
-    st.success("🎉 恭喜您完成了一次自我照顧的練習！來看看您今天的收穫：")
-    
+    st.success("🎉 恭喜您完成了一次自我照顧的練習。來看看這次留下的軌跡。")
+
     col_chart1, col_chart2 = st.columns(2)
-    
+
     with col_chart1:
         st.markdown("#### 🔋 您的能量流動軌跡")
-        df_chart = pd.DataFrame(st.session_state.energy_log)
-        
-        line = alt.Chart(df_chart).mark_line(color='#424242', size=4).encode(
-            x=alt.X('階段:N', sort=alt.EncodingSortField(field='排序', order='ascending'), title='對話階段', axis=alt.Axis(labelAngle=-45, labelFontSize=12)),
-            y=alt.Y('分數:Q', scale=alt.Scale(domain=[0, 10]), title='狀態分數')
-        )
-        points = alt.Chart(df_chart).mark_circle(size=150, color='#1E88E5', opacity=1).encode(
-            x=alt.X('階段:N', sort=alt.EncodingSortField(field='排序', order='ascending')),
-            y=alt.Y('分數:Q'),
-            tooltip=['階段', '分數']
-        )
-        band_red = alt.Chart(pd.DataFrame({'y1': [7], 'y2': [10]})).mark_rect(color='#ffcccc', opacity=0.4).encode(y='y1:Q', y2='y2:Q')
-        band_green = alt.Chart(pd.DataFrame({'y1': [4], 'y2': [7]})).mark_rect(color='#ccffcc', opacity=0.4).encode(y='y1:Q', y2='y2:Q')
-        band_blue = alt.Chart(pd.DataFrame({'y1': [0], 'y2': [4]})).mark_rect(color='#cce5ff', opacity=0.4).encode(y='y1:Q', y2='y2:Q')
-        
-        first_stage = df_chart['階段'].iloc[0]
-        text_red = alt.Chart(pd.DataFrame({'x': [first_stage], 'y': [9], 'text': ['🔥 過度激患 (焦慮/煩躁)']})).mark_text(align='left', dx=10, fontSize=14, color='#d32f2f', fontWeight='bold', opacity=0.5).encode(x='x:N', y='y:Q', text='text:N')
-        text_green = alt.Chart(pd.DataFrame({'x': [first_stage], 'y': [5.5], 'text': ['💚 容納之窗 (平靜/穩定)']})).mark_text(align='left', dx=10, fontSize=14, color='#2e7d32', fontWeight='bold', opacity=0.5).encode(x='x:N', y='y:Q', text='text:N')
-        text_blue = alt.Chart(pd.DataFrame({'x': [first_stage], 'y': [2], 'text': ['❄️ 過低激患 (疲憊/無力)']})).mark_text(align='left', dx=10, fontSize=14, color='#1565c0', fontWeight='bold', opacity=0.5).encode(x='x:N', y='y:Q', text='text:N')
 
-        final_chart = alt.layer(band_red, band_green, band_blue, text_red, text_green, text_blue, line, points).properties(height=350)
-        st.altair_chart(final_chart, use_container_width=True)
+        if st.session_state.energy_log:
+            df_chart = pd.DataFrame(st.session_state.energy_log)
+
+            line = alt.Chart(df_chart).mark_line(color="#424242", size=4).encode(
+                x=alt.X(
+                    "階段:N",
+                    sort=alt.EncodingSortField(field="排序", order="ascending"),
+                    title="對話階段",
+                    axis=alt.Axis(labelAngle=-45, labelFontSize=12),
+                ),
+                y=alt.Y("分數:Q", scale=alt.Scale(domain=[0, 10]), title="狀態分數"),
+            )
+
+            points = alt.Chart(df_chart).mark_circle(size=150, color="#1E88E5").encode(
+                x=alt.X("階段:N", sort=alt.EncodingSortField(field="排序", order="ascending")),
+                y=alt.Y("分數:Q"),
+                tooltip=["階段", "分數"],
+            )
+
+            band_red = alt.Chart(pd.DataFrame({"y1": [7], "y2": [10]})).mark_rect(
+                color="#ffcccc", opacity=0.4
+            ).encode(y="y1:Q", y2="y2:Q")
+
+            band_green = alt.Chart(pd.DataFrame({"y1": [4], "y2": [7]})).mark_rect(
+                color="#ccffcc", opacity=0.4
+            ).encode(y="y1:Q", y2="y2:Q")
+
+            band_blue = alt.Chart(pd.DataFrame({"y1": [0], "y2": [4]})).mark_rect(
+                color="#cce5ff", opacity=0.4
+            ).encode(y="y1:Q", y2="y2:Q")
+
+            first_stage = df_chart["階段"].iloc[0]
+            labels = pd.DataFrame({
+                "x": [first_stage, first_stage, first_stage],
+                "y": [9, 5.5, 2],
+                "text": [
+                    "紅區：過度激發",
+                    "綠區：容納之窗",
+                    "藍區：過低激發",
+                ],
+                "color": ["#d32f2f", "#2e7d32", "#1565c0"],
+            })
+
+            text_layer = alt.Chart(labels).mark_text(
+                align="left",
+                dx=10,
+                fontSize=13,
+                fontWeight="bold",
+                opacity=0.55,
+            ).encode(
+                x="x:N",
+                y="y:Q",
+                text="text:N",
+                color=alt.Color("color:N", scale=None),
+            )
+
+            final_chart = alt.layer(
+                band_red,
+                band_green,
+                band_blue,
+                text_layer,
+                line,
+                points,
+            ).properties(height=350)
+
+            st.altair_chart(final_chart, use_container_width=True)
+        else:
+            st.info("尚無能量紀錄。")
 
     with col_chart2:
-        st.markdown("#### 🌟 您的六大美德優勢 (VIA)")
+        st.markdown("#### 🌟 您的六大美德優勢 VIA")
+
         if st.session_state.strengths_data:
-            s_data = st.session_state.strengths_data
-            df_radar = pd.DataFrame(dict(
-                r=list(s_data.values()),
-                theta=list(s_data.keys())
-            ))
-            fig = px.line_polar(df_radar, r='r', theta='theta', line_close=True, range_r=[0, 10])
-            fig.update_traces(fill='toself', fillcolor='rgba(255, 165, 0, 0.4)', line_color='darkorange')
+            ordered_strengths = {
+                key: st.session_state.strengths_data.get(key, 0)
+                for key in VIA_KEYS
+            }
+
+            df_radar = pd.DataFrame({
+                "r": list(ordered_strengths.values()),
+                "theta": list(ordered_strengths.keys()),
+            })
+
+            fig = px.line_polar(
+                df_radar,
+                r="r",
+                theta="theta",
+                line_close=True,
+                range_r=[0, 10],
+            )
+
+            fig.update_traces(
+                fill="toself",
+                fillcolor="rgba(255, 165, 0, 0.35)",
+                line_color="darkorange",
+            )
+
             fig.update_layout(
                 polar=dict(radialaxis=dict(visible=True, range=[0, 10])),
                 showlegend=False,
                 margin=dict(l=40, r=40, t=20, b=20),
-                height=350
+                height=350,
             )
+
             st.plotly_chart(fig, use_container_width=True)
         else:
-            st.info("尚無足夠資料產生優勢雷達圖。")
-            
+            st.info("這次沒有成功產生 VIA 雷達圖。您仍可以下載完整紀錄。")
+
     st.markdown("""
-    > 💡 **教練的悄悄話**：
-    > 情緒是流動的，而您的力量一直都在。即使在最耗能的時刻，您依然展現了雷達圖上這些閃閃發光的優勢特質。
-    > 點擊下方下載您的專屬紀錄，明天再來找我充充電吧！
-    """)
-    
+> **教練的悄悄話**  
+> 情緒是流動的，而您的力量也不是只在狀態好的時候才存在。  
+> 即使在耗能的時刻，您仍可能展現了某些值得被看見的優勢。
+""")
+
     st.markdown("---")
-    colA, colB = st.columns(2)
-    
-    with colA:
-        export_data = {
-            "nickname": st.session_state.user_nickname,
-            "history": st.session_state.history,
-            "energy_log": st.session_state.energy_log,
-            "strengths_data": st.session_state.strengths_data
-        }
-        json_str = json.dumps(export_data, ensure_ascii=False, indent=2)
+
+    export_data = build_export_data()
+    json_str = json.dumps(export_data, ensure_ascii=False, indent=2)
+
+    col_a, col_b = st.columns(2)
+
+    with col_a:
         st.download_button(
-            label="📥 下載專屬充電記憶 (.json)",
-            data=json_str,
-            file_name=f"ChargeCoach_Memory_{st.session_state.user_nickname}_{datetime.now().strftime('%Y%m%d')}.json",
+            label="📥 下載專屬充電記憶 JSON",
+            data=json_str.encode("utf-8-sig"),
+            file_name=f"ChargeCoach_Memory_{sanitize_filename(st.session_state.user_nickname)}_{now_tw().strftime('%Y%m%d')}.json",
             mime="application/json",
-            type="primary"
+            type="primary",
         )
-        
-    with colB:
+
+    with col_b:
         if st.button("🏠 登出 / 下一位使用者"):
-            reset_app()
+            reset_app(clear_keys=True)
             st.rerun()
