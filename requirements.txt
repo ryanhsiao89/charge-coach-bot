@@ -4,5 +4,3 @@ altair>=5.0
 plotly>=5.18
 google-generativeai>=0.8.3,<0.9
 pypdf
-gspread>=6.0
-oauth2client>=4.1.3
