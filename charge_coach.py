@@ -1,157 +1,100 @@
-            maybe_update_memory(force=True)
-            st.session_state.strengths_data = analyze_strengths()
-            save_session_to_google_sheets(final=True)
+import re
+import json
+import time
+import uuid
+from datetime import datetime, timedelta, timezone
 
-        st.session_state.app_phase = "show_chart"
-        st.rerun()
+import altair as alt
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+
+import google.generativeai as genai
+from google.generativeai.types import GenerationConfig, HarmCategory, HarmBlockThreshold
+
+import gspread
+from gspread.exceptions import WorksheetNotFound
+from google.oauth2.service_account import Credentials
 
 
-# ------------------------------
-# 階段 5：顯示圖表與下載
-# ------------------------------
-elif st.session_state.app_phase == "show_chart":
-    st.success("🎉 恭喜您完成了一次自我照顧的練習。來看看這次留下的軌跡。")
+# =========================================================
+# 1. 系統設定
+# =========================================================
+st.set_page_config(
+    page_title="溫充電教練",
+    layout="wide",
+    page_icon="☕",
+)
 
-    col_chart1, col_chart2 = st.columns(2)
+APP_TITLE = "☕ 溫充電教練"
+DEFAULT_MODEL_NAME = "gemini-2.5-flash-lite"
+MODEL_OPTIONS = ["gemini-2.5-flash-lite", "gemini-2.5-flash"]
 
-    with col_chart1:
-        st.markdown("#### 🔋 您的能量流動軌跡")
+TAIPEI_TZ = timezone(timedelta(hours=8))
 
-        if st.session_state.energy_log:
-            df_chart = pd.DataFrame(st.session_state.energy_log)
+RECENT_TURNS_FOR_CHAT = 10
+MEMORY_UPDATE_EVERY_MESSAGES = 8
+MAX_MEMORY_OUTPUT_TOKENS = 700
+MAX_CHAT_OUTPUT_TOKENS = 500
+MAX_STRENGTHS_OUTPUT_TOKENS = 500
 
-            line = alt.Chart(df_chart).mark_line(color="#424242", size=4).encode(
-                x=alt.X(
-                    "階段:N",
-                    sort=alt.EncodingSortField(field="排序", order="ascending"),
-                    title="對話階段",
-                    axis=alt.Axis(labelAngle=-45, labelFontSize=12),
-                ),
-                y=alt.Y("分數:Q", scale=alt.Scale(domain=[0, 10]), title="狀態分數"),
-            )
+KEY_COOLDOWN_SECONDS = 60
+RETRY_WAIT_SECONDS = 60
+DAILY_QUOTA_COOLDOWN_SECONDS = 12 * 60 * 60
 
-            points = alt.Chart(df_chart).mark_circle(size=150, color="#1E88E5").encode(
-                x=alt.X("階段:N", sort=alt.EncodingSortField(field="排序", order="ascending")),
-                y=alt.Y("分數:Q"),
-                tooltip=["階段", "分數"],
-            )
+MIN_USER_MESSAGES_FOR_STRENGTHS = 3
+MIN_USER_CHARS_FOR_STRENGTHS = 40
 
-            band_red = alt.Chart(pd.DataFrame({"y1": [7], "y2": [10]})).mark_rect(
-                color="#ffcccc", opacity=0.4
-            ).encode(y="y1:Q", y2="y2:Q")
+SPREADSHEET_NAME = "2025創傷知情研習數據"
+WORKSHEET_NAME = "Charge Coach"
+SHEET_CELL_CHAR_LIMIT = 45000
+SHEET_HEADERS = [
+    "登入時間",
+    "登出時間",
+    "學員編號",
+    "使用分鐘數",
+    "累積使用次數",
+    "完整對話紀錄",
+]
 
-            band_green = alt.Chart(pd.DataFrame({"y1": [4], "y2": [7]})).mark_rect(
-                color="#ccffcc", opacity=0.4
-            ).encode(y="y1:Q", y2="y2:Q")
+VIA_KEYS = ["智慧與知識", "勇氣", "人道", "正義", "節制", "超越"]
 
-            band_blue = alt.Chart(pd.DataFrame({"y1": [0], "y2": [4]})).mark_rect(
-                color="#cce5ff", opacity=0.4
-            ).encode(y="y1:Q", y2="y2:Q")
+SAFETY_SETTINGS = {
+    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+}
 
-            first_stage = df_chart["階段"].iloc[0]
-            labels = pd.DataFrame({
-                "x": [first_stage, first_stage, first_stage],
-                "y": [9, 5.5, 2],
-                "text": [
-                    "紅區：過度激發",
-                    "綠區：容納之窗",
-                    "藍區：過低激發",
-                ],
-                "color": ["#d32f2f", "#2e7d32", "#1565c0"],
-            })
 
-            text_layer = alt.Chart(labels).mark_text(
-                align="left",
-                dx=10,
-                fontSize=13,
-                fontWeight="bold",
-                opacity=0.55,
-            ).encode(
-                x="x:N",
-                y="y:Q",
-                text="text:N",
-                color=alt.Color("color:N", scale=None),
-            )
+# =========================================================
+# 2. 基礎工具
+# =========================================================
+def utc_now():
+    return datetime.now(timezone.utc)
 
-            final_chart = alt.layer(
-                band_red,
-                band_green,
-                band_blue,
-                text_layer,
-                line,
-                points,
-            ).properties(height=350)
 
-            st.altair_chart(final_chart, use_container_width=True)
-        else:
-            st.info("尚無能量紀錄。")
+def now_tw():
+    return utc_now().astimezone(TAIPEI_TZ)
 
-    with col_chart2:
-        st.markdown("#### 🌟 您的六大美德優勢 VIA")
 
-        if st.session_state.strengths_data:
-            ordered_strengths = {
-                key: st.session_state.strengths_data.get(key, 0)
-                for key in VIA_KEYS
-            }
+def format_tw(dt):
+    if not dt:
+        return ""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
-            df_radar = pd.DataFrame({
-                "r": list(ordered_strengths.values()),
-                "theta": list(ordered_strengths.keys()),
-            })
 
-            fig = px.line_polar(
-                df_radar,
-                r="r",
-                theta="theta",
-                line_close=True,
-                range_r=[0, 10],
-            )
+def safe_secret_get(section, default=None):
+    try:
+        return st.secrets.get(section, default)
+    except Exception:
+        return default
 
-            fig.update_traces(
-                fill="toself",
-                fillcolor="rgba(255, 165, 0, 0.35)",
-                line_color="darkorange",
-            )
 
-            fig.update_layout(
-                polar=dict(radialaxis=dict(visible=True, range=[0, 10])),
-                showlegend=False,
-                margin=dict(l=40, r=40, t=20, b=20),
-                height=350,
-            )
+def parse_api_keys(raw_value):
+    if not raw_value:
+        return []
 
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            detail = st.session_state.get("strengths_warning", "")
-            if detail:
-                st.info(f"{detail} 您仍可以下載完整紀錄，能量走勢也已保留。")
-            else:
-                st.info("這次沒有成功產生 VIA 雷達圖。您仍可以下載完整紀錄，能量走勢也已保留。")
-
-    st.markdown("""
-> **教練的悄悄話**  
-> 情緒是流動的，而您的力量也不是只在狀態好的時候才存在。  
-> 即使在耗能的時刻，您仍可能展現了某些值得被看見的優勢。
-""")
-
-    st.markdown("---")
-
-    export_data = build_export_data()
-    json_str = json.dumps(export_data, ensure_ascii=False, indent=2)
-
-    col_a, col_b = st.columns(2)
-
-    with col_a:
-        st.download_button(
-            label="📥 下載專屬充電記憶 JSON",
-            data=json_str.encode("utf-8-sig"),
-            file_name=f"ChargeCoach_Memory_{sanitize_filename(st.session_state.user_nickname)}_{now_tw().strftime('%Y%m%d')}.json",
-            mime="application/json",
-            type="primary",
-        )
-
-    with col_b:
-        if st.button("🏠 登出 / 下一位使用者"):
-            reset_app(clear_keys=True)
-            st.rerun()
+    if isinstance(raw_value, list):
