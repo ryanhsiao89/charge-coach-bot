@@ -98,3 +98,6 @@ def parse_api_keys(raw_value):
         return []
 
     if isinstance(raw_value, list):
+        return [str(k).strip() for k in raw_value if str(k).strip()]
+
+    return [k.strip() for k in re.split(r"[\n,]+", str(raw_value)) if k.strip()]
